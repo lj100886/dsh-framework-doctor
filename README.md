@@ -1,0 +1,152 @@
+<p align="center">
+  <img src="icon.svg" width="72" alt="Framework Doctor icon">
+</p>
+
+# dsh-framework-doctor
+
+English | [中文](README.zh.md)
+
+A DeepSeek Harness plugin that configures model providers by probing their
+endpoint, checks framework health, and repairs what can be fixed — from a
+standalone settings page. Nothing runs in the background.
+
+## What it does
+
+The plugin adds one page: **Settings → Framework doctor**. It has four sections.
+
+### 1. Connect a model
+
+Paste an endpoint URL and an API key, press **Probe**, and the plugin asks
+`{baseURL}/models` for the model list, then derives each model's capabilities:
+
+| Derived field | Source |
+|---|---|
+| Input modalities (`text` / `image`) | endpoint metadata, then the model-family table |
+| Context window, max output tokens | endpoint metadata, then the family table |
+| Reasoning efforts | the family table (or `false` for a non-reasoning model) |
+| `compat.thinkingFormat` | the family table (`deepseek`, `qwen-chat-template`, `zai`, `openrouter`, `openai`) |
+
+Anything the endpoint does not state and the family table cannot infer is left
+**empty rather than guessed** — a wrong reasoning-effort map makes the whole
+provider fail its request. Each row shows whether its values were declared by
+the endpoint or inferred, so you can tell the two apart before writing.
+
+Already-configured providers can be re-probed and filled in the same way: pick
+one from the dropdown and the form is populated (the stored credential is reused,
+so you do not retype the key). Writing in that mode **merges** — models you
+hand-wrote are kept, newly advertised models are appended, and capability fields
+are filled in from the endpoint.
+
+API keys are stored through the harness credential service; the config keeps only
+an `apiKeyEnv` reference, never the key itself.
+
+### 2. Framework checkup
+
+23 checks run against the live configuration and runtime state: 18 against the
+`llm-pi-ai` provider config, 5 against runtime facts (plugin load phase,
+registered providers, the default model).
+
+They cover the failures that actually happen: a hand-written provider with no
+`baseURL`, a credential reference that resolves to nothing, a plaintext key left
+in `headers`, a reasoning model with no effort map, a **non-reasoning model
+carrying one** (a 400 on every request), duplicate model ids, a default model
+pointing at a provider that does not exist, and so on.
+
+Providers registered by *other* plugins are reported as `external-provider`
+(info) rather than as missing configuration — a provider is considered real when
+it is registered with the model service, not only when it appears in this config.
+
+### 3. Talk to the doctor
+
+A chat box. You describe what you want; the assistant looks up the real state
+before answering. It can request framework data on demand through six read-only
+tools:
+
+| Tool | What it returns |
+|---|---|
+| `state` | Provider list with baseURL, protocol, credential state, and per-model modalities / context / output cap / reasoning efforts; the default model; registered routes |
+| `diagnose` | The full checkup result with severities |
+| `plugins` | Plugin rows: package, enabled flag, load phase |
+| `tools` | The tools this agent can currently call |
+| `provider` | One provider's full config (keys redacted) |
+| `probe` | Live endpoint interrogation |
+
+The assistant writes `TOOL: {"name":"...","args":{...}}`, the host runs it and
+feeds the result back, up to 4 rounds. The page shows which tools it consulted.
+
+Anything the assistant suggests that *changes* something is rendered as a button
+you have to press: re-run the checkup, auto-repair, repair one finding, probe an
+endpoint, or probe-and-write a provider. The model never edits configuration on
+its own.
+
+### 4. Repair
+
+Auto-fixable findings can be applied in one click. Repairs are generated as
+`settings.mutate` operations: they only ever produce `set`, never `unset`, with
+two deliberate exceptions (drop a duplicate model id, and set `reasoningEfforts`
+to `false` on a model that should not have one).
+
+## Install
+
+```sh
+dsh plugin --profile <your-profile> add dsh-framework-doctor
+```
+
+Or from a local checkout:
+
+```sh
+dsh plugin --profile <your-profile> add /absolute/path/to/dsh-framework-doctor
+```
+
+Restart `dsh web` if the page does not appear, then open **Settings → Framework
+doctor**.
+
+## What it deliberately does not do
+
+- **No background scanning.** Health checks run when you press a button. There is
+  no timer and no polling.
+- **No automatic configuration changes.** Every write is either a click in the
+  connect wizard or a click on an assistant-suggested action.
+- **No plaintext secrets.** Keys go to the credential service; `headers` values
+  are checked for plaintext keys and reported.
+- **No guessing.** Unverifiable model capabilities are left unset.
+
+## Requirements
+
+- DeepSeek Harness `>=0.2.0` (`engines.dsh`; also declared under
+  `dsh.compatibility`)
+- Node.js `>=20.18`
+- A configured default model, for the chat section only. Everything else works
+  without one.
+
+No runtime dependencies. The plugin uses only Node built-ins and the harness
+services it injects.
+
+## Development
+
+```sh
+node tests/run-all.mjs    # or: npm test
+```
+
+Three suites, none of which need a running harness:
+
+| Suite | Checks |
+|---|---|
+| `tests/framework-doctor-lib.mjs` | `lib/infer.js` capability derivation, `lib/diagnose.js` rules, `lib/repair.js` plans, plus an end-to-end probe against a local fake OpenAI-compatible endpoint |
+| `tests/framework-doctor-host.mjs` | Host routes, `/apply` validation and merge semantics, `/chat` tool loop, the trust fence, and degradation when a service is missing |
+| `tests/framework-doctor-client.mjs` | Loads `client.js` against a stubbed module loader and React, renders every section, and checks theme-token and boundary constraints |
+
+### Layout
+
+| File | Role |
+|---|---|
+| `index.js` | Host entry: HTTP routes, settings read/write, the chat tool loop |
+| `client.js` | The settings page (plain JS + `createElement`, no build step) |
+| `lib/infer.js` | Endpoint interrogation and capability derivation |
+| `lib/diagnose.js` | The checkup rules |
+| `lib/repair.js` | Findings to `settings.mutate` operations |
+| `lib/trust.js` | Request trust fence for the plugin's HTTP surface |
+
+## License
+
+MIT — see [LICENSE](LICENSE).

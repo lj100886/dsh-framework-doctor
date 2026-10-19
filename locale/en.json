@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Framework Doctor",
+    "description": "Point it at an API endpoint and it configures model modalities, reasoning efforts, and wire compatibility for you; then continuously checks framework health and repairs configuration and plugin faults. A standalone settings page, never a chat surface."
+  }
+}

@@ -1,0 +1,69 @@
+{
+  "name": "dsh-framework-doctor",
+  "version": "0.1.0",
+  "description": "Configure model providers by probing their endpoint, check DeepSeek Harness health, and repair what can be fixed — all from a standalone settings page.",
+  "type": "module",
+  "license": "MIT",
+  "author": "lj100886",
+  "homepage": "https://github.com/lj100886/dsh-framework-doctor",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lj100886/dsh-framework-doctor.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lj100886/dsh-framework-doctor/issues"
+  },
+  "icon": "icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "lib/*.js",
+    "tests/*.mjs",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "model-provider",
+    "diagnostics",
+    "health-check",
+    "openai-compatible",
+    "reasoning-effort"
+  ],
+  "engines": {
+    "node": ">=20.18",
+    "dsh": ">=0.2.0"
+  },
+  "scripts": {
+    "test": "node tests/run-all.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "compatibility": {
+      "dsh": ">=0.2.0",
+      "profiles": ["web", "desktop"]
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
+}

@@ -1,0 +1,11 @@
+# dsh-framework-doctor — bundle patch layer
+#
+# One Host row (HTTP routes + settings read/write) plus one Client module
+# (the standalone settings page). Install with plugin_manager install_bundle,
+# targeting this directory's absolute path.
+- insert:
+    - id: framework-doctor
+      name: 'dsh-framework-doctor'
+      config:
+        enabled: true
+        probeTimeoutMs: 15000
