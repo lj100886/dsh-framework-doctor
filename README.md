@@ -189,21 +189,38 @@ doctor**.
   are checked for plaintext keys and reported.
 - **No guessing.** Unverifiable model capabilities are left unset.
 
-## Why it cannot read other plugins' billing
+## Reading other channel plugins
 
-Channel plugins such as `dsh-our-free-model` keep balance, credits and accounts
-inside their own UI. Checked directly:
+Two different data sources, because they have two different access models.
 
-- their stats payload carries usage only (token counts, call counts, failures,
-  latency) — no balance or credit field;
-- their HTTP API sits behind the browser credential fence. A Host-side request
-  to `/api/our-free-model/summary` returns **401**, and they publish no
-  `ctx.provide()` service for other plugins to call.
+**Local caches — Host reads the files.** Channel plugins keep their availability
+verdict on disk (for `dsh-our-free-model`: `$DSH_HOME/our-free-model/`). Those
+files need no authentication, so the Host reads them directly and reports what
+the *endpoint itself* said, which is far more useful than an error code:
 
-So the doctor reports the *shape* of the problem ("this looks like quota, retry
-will not help, here is the channel") and hands you a link to the page that owns
-the account. Showing someone else's balance would mean guessing, and a wrong
-number there is worse than no number.
+```
+Our Free Model (checked 2026-10-20T14:20:56Z)
+  egress: 203.0.113.7 (CN)
+  flagged as abusive traffic, service refused (10 models — switching model will
+  not help, the egress IP needs to change):
+    · big-pickle: ...we've detected abusive traffic from this IP address...
+```
+
+`availability.json` carries per-model state and the endpoint's own detail string;
+`catalog.json` carries the advertised list. Both are read read-only, and a missing
+or malformed file just yields an empty result.
+
+**Live billing — the browser reads it.** Balance and credits are *not* cached to
+disk; they are fetched live from the upstream gateways. Those endpoints sit
+behind the harness connection fence, so a Host request gets 401 — but this
+plugin's page runs *in the browser*, with the same session cookie, so it can call
+them directly. That is why billing is read client-side while availability is read
+Host-side.
+
+When a failure looks like quota, the page shows the live balance plus a link to
+the page that owns the account. It never invents a number: if the channel plugin
+is absent, not signed in, or changed its API, the panel says so quietly and stops
+there.
 
 ## Requirements
 

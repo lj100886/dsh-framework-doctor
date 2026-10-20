@@ -21,6 +21,10 @@
  * 时对应那部分体检降级为"未检查"，而不是抛错。
  */
 
+import os from 'node:os';
+import path from 'node:path';
+import { readFileSync } from 'node:fs';
+
 import { rejectionFor, connectionAdmissionView } from './lib/trust.js';
 
 const name = 'framework-doctor';
@@ -362,6 +366,76 @@ function apply(ctx, config) {
   const loadRepair = () => load('repair', () => import('./lib/repair.js'));
   const loadFailover = () => load('failover', () => import('./lib/failover.js'));
   const loadAssistantModel = () => load('assistant-model', () => import('./lib/assistant-model.js'));
+  const loadLocalChannelState = () => load('local-channel-state', () => import('./lib/local-channel-state.js'));
+
+  /**
+   * 同步读渠道插件的本地可用性缓存。
+   *
+   * `/state` 是同步处理器，所以这里不走 lazy import —— 用 fs 直接读，
+   * 逻辑和 lib/local-channel-state.js 一致（那个模块供 chat 的工具用异步导入）。
+   * 任何失败都返回空数组：读不到别家缓存不该影响本插件。
+   */
+  function readChannelCacheSync() {
+    try {
+      const home = resolveDshHome();
+      if (!home) return [];
+      const dir = path.join(home, 'our-free-model');
+      const readJson = (name) => {
+        try {
+          return JSON.parse(readFileSync(path.join(dir, name), 'utf8'));
+        } catch {
+          return null;
+        }
+      };
+      const availability = readJson('availability.json');
+      const catalog = readJson('catalog.json');
+      if (!availability && !catalog) return [];
+
+      const results = availability && isObject(availability.results) ? availability.results : {};
+      const models = [];
+      for (const [id, row] of Object.entries(results)) {
+        if (!isObject(row)) continue;
+        models.push({
+          id,
+          state: typeof row.state === 'string' ? row.state : 'unknown',
+          detail: typeof row.detail === 'string' ? row.detail : '',
+          latencyMs: typeof row.latencyMs === 'number' ? row.latencyMs : null,
+          checkedAt: typeof row.at === 'number' ? row.at : null,
+        });
+      }
+      return [{
+        provider: 'our-free-model',
+        label: 'Our Free Model',
+        checkedAt: typeof availability?.at === 'number' ? availability.at : null,
+        egress: isObject(availability?.egress)
+          ? {
+              ip: typeof availability.egress.ip === 'string' ? availability.egress.ip : '',
+              country: typeof availability.egress.country === 'string' ? availability.egress.country : '',
+            }
+          : null,
+        models,
+        listed: Array.isArray(catalog?.entries) ? catalog.entries.filter((id) => typeof id === 'string') : [],
+        kiloCount: Array.isArray(catalog?.kiloRows) ? catalog.kiloRows.length : 0,
+      }];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * DSH home：渠道插件把缓存放在 `<home>/<plugin>/` 下。
+   * 与 harness 自己解析的方式一致：环境变量优先，否则 `~/.dsh`。
+   */
+  function resolveDshHome() {
+    const fromEnv = process.env.DSH_HOME;
+    if (typeof fromEnv === 'string' && fromEnv.length > 0) return fromEnv;
+    try {
+      // 用 os.homedir() 而不是拼 $HOME，Windows 上后者不总对。
+      return path.join(os.homedir(), '.dsh');
+    } catch {
+      return '';
+    }
+  }
 
   /** 最近一次扫描结果，供 /state 与页面首屏使用。 */
   let lastScan = null;
@@ -518,6 +592,7 @@ function apply(ctx, config) {
     ['provider', '{"route":"配置名"}', '某个 provider 的完整配置（密钥已脱敏）'],
     ['probe', '{"baseURL":"https://...","api":"可选","apiKey":"可选"}', '实时访问一个端点，返回它公布的模型清单与推导出的能力'],
     ['channel-health', '{}', '各渠道最近的失败档案：错误类型、连续失败次数、严重度、是否额度问题、冷却到什么时候。写"哪个渠道坏了 / 要不要充值 / 什么时候恢复"这类报告时用它'],
+    ['channel-cache', '{}', '读渠道插件落在本地磁盘上的状态缓存：每个模型为什么不可用（区域封锁 / 被判定滥用流量 / 其它），附端点原话和出口 IP。比看错误码精确'],
   ];
 
   /** 执行一次信息工具，返回给模型看的纯文本。任何失败都变成可读文本，不抛。 */
@@ -643,6 +718,15 @@ function apply(ctx, config) {
             'scope=channel 且连续失败多次说明该端点真的不稳；scope=transport 多半是本地网络。',
         );
         return lines.join('\n');
+      }
+
+      if (tool === 'channel-cache') {
+        const loaded = await loadLocalChannelState();
+        if (!loaded.ok) return `本地缓存模块加载失败：${loaded.error}`;
+        const home = resolveDshHome();
+        if (!home) return '解析不出 DSH home，无法定位渠道插件的缓存目录。';
+        const states = loaded.mod.readAllLocalChannelStates(home);
+        return loaded.mod.describeLocalStates(states);
       }
 
       return `未知的信息工具 "${tool}"。可用的：${INFO_TOOLS.map((t) => t[0]).join('、')}`;
@@ -1398,6 +1482,9 @@ function apply(ctx, config) {
         health: lastScan?.health ?? null,
         summary: lastScan?.summary ?? null,
         channelHealth: failoverState ? failoverState.report() : [],
+        // 渠道插件落在磁盘上的可用性缓存（Host 直接读，无需鉴权）。
+        // 文件只有几 KB，且页面只在打开时取一次，所以这里同步读、失败就空。
+        channelCache: readChannelCacheSync(),
         // 框架医生自己用哪个模型、这条链现在还有没有能跑的。
         assistantModel: (() => {
           const selection = readDefaultSelection(ctx);

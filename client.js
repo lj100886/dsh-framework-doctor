@@ -84,6 +84,10 @@ window.__ModuleLoader__.load({
 .__fd_root .__fd_chainIdx{font-weight:600;color:var(--dsw-alias-label-tertiary)}
 .__fd_root .__fd_billing{border-top:1px dashed var(--dsw-alias-border-l1);padding-top:8px;display:flex;flex-direction:column;gap:6px}
 .__fd_root .__fd_billingText{font-size:12px;color:var(--dsw-alias-state-warn-primary);margin:0}
+.__fd_root .__fd_billingRow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px}
+.__fd_root .__fd_billingLabel{font-weight:600}
+.__fd_root .__fd_cache{border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-2);padding:10px 12px;margin-bottom:10px;display:flex;flex-direction:column;gap:8px}
+.__fd_root .__fd_cacheRow{display:flex;gap:8px;align-items:flex-start;font-size:12px}
 .__fd_root .__fd_report{border:1px solid var(--dsw-alias-border-l2);border-radius:8px;overflow:hidden;margin-bottom:10px}
 .__fd_root .__fd_chat{display:flex;flex-direction:column;gap:10px}
 .__fd_root .__fd_chatList{display:flex;flex-direction:column;gap:10px;max-height:460px;overflow-y:auto;padding:4px 2px}
@@ -235,6 +239,19 @@ window.__ModuleLoader__.load({
       billingHint: '检测到 {n} 个渠道出现额度/限流问题——这类问题重试没用，需要你去充值或换套餐。',
       openBilling: '去处理额度',
       billingWhere: '余额、积分、账号都在「设置 → Our Free Model」这类渠道插件页里；框架医生读不到别家的账单，只能把你送过去。',
+      billingLoading: '正在查询余额…',
+      billingUnavailable: '暂时读不到余额',
+      billingRefresh: '刷新',
+      billingCredits: '剩余积分 {n}',
+      billingDollars: '剩余余额 ${n}',
+      billingAccounts: '{n} 个账号',
+      billingLow: '{n} 个已耗尽',
+      channelCacheTitle: '渠道自称的失效原因',
+      channelCacheHint: '读自渠道插件落在本地的缓存，是端点自己的判定，比看错误码准',
+      cacheAbuse: '被判定滥用流量、拒绝服务（{n} 个模型）',
+      cacheRegional: '当前地区不可用（{n} 个模型）',
+      cacheOther: '其它不可用（{n} 个模型）',
+      cacheEgress: '出口 {ip}',
       allGood: '没有发现问题，框架是健康的。',
       diagFail: '体检失败',
       autoFixable: '可自动修复',
@@ -361,6 +378,19 @@ window.__ModuleLoader__.load({
       billingHint: '{n} channel(s) hit quota or rate limits — retrying will not help; this needs a top-up or a plan change.',
       openBilling: 'Handle quota',
       billingWhere: 'Balance, credits and accounts live in channel plugins such as Settings → Our Free Model; the doctor cannot read their billing, so it only takes you there.',
+      billingLoading: 'Checking balance…',
+      billingUnavailable: 'Balance not readable right now',
+      billingRefresh: 'Refresh',
+      billingCredits: 'Credits left {n}',
+      billingDollars: 'Balance left ${n}',
+      billingAccounts: '{n} account(s)',
+      billingLow: '{n} exhausted',
+      channelCacheTitle: 'What the channel itself says',
+      channelCacheHint: 'Read from the channel plugin cache on disk — the endpoint\'s own verdict, not an error code',
+      cacheAbuse: 'Flagged as abusive traffic, refused service ({n} models)',
+      cacheRegional: 'Not available in this region ({n} models)',
+      cacheOther: 'Otherwise unavailable ({n} models)',
+      cacheEgress: 'egress {ip}',
       allGood: 'No findings — the framework is healthy.',
       diagFail: 'Check failed',
       autoFixable: 'auto-fixable',
@@ -1080,8 +1110,13 @@ window.__ModuleLoader__.load({
       h(AssistantModelPanel, {
         t: t,
         data: props.data,
+        billing: props.billing,
         onOpenBilling: props.onOpenBilling,
+        onRefreshBilling: props.onRefreshBilling,
       }),
+
+      /* 渠道插件磁盘缓存里的真实失效原因（区域封锁 / 滥用流量）。 */
+      h(ChannelCachePanel, { t: t, channelCache: props.channelCache }),
 
       diag.status === 'idle' ? h('p', { className: '__fd_hint' }, t('loading')) : null,
       diag.error ? h('p', { className: '__fd_error' }, t('diagFail') + '：' + diag.error) : null,
@@ -1097,6 +1132,66 @@ window.__ModuleLoader__.load({
             return findingRow(t, finding, props.repair, props.onRepairOne);
           }));
       }));
+    }
+
+    /**
+     * 渠道插件磁盘缓存里的可用性状态。
+     *
+     * 这是 Host 直接读文件拿到的（不需要鉴权），内容是端点自己给的判定：
+     * 「该 IP 被判定滥用流量」「地区受限」等。比 429 有用得多——
+     * 429 只说明"这次被拒了"，这里说明"为什么、还能不能救"。
+     */
+    function ChannelCachePanel(props) {
+      var t = props.t;
+      var caches = Array.isArray(props.channelCache) ? props.channelCache : [];
+
+      var rows = [];
+      caches.forEach(function (cache) {
+        var abuse = [];
+        var regional = [];
+        var other = [];
+        (cache.models || []).forEach(function (row) {
+          if (row.state === 'available' || row.state === 'ok') return;
+          var detail = String(row.detail || '').toLowerCase();
+          if (detail.indexOf('abusive traffic') >= 0 || detail.indexOf('abuse') >= 0) abuse.push(row);
+          else if (row.state === 'region-blocked' || detail.indexOf('your country') >= 0) regional.push(row);
+          else other.push(row);
+        });
+        if (abuse.length) rows.push({ kind: 'abuse', cache: cache, items: abuse });
+        if (regional.length) rows.push({ kind: 'regional', cache: cache, items: regional });
+        if (other.length) rows.push({ kind: 'other', cache: cache, items: other });
+      });
+
+      if (rows.length === 0) return null;
+
+      return h('div', { className: '__fd_cache' },
+        h('div', { className: '__fd_assistHead' },
+          h('span', { className: '__fd_assistTitle' }, t('channelCacheTitle')),
+          h('span', { className: '__fd_hint' }, t('channelCacheHint'))),
+        rows.map(function (group, index) {
+          var kindText = group.kind === 'abuse' ? t('cacheAbuse')
+            : group.kind === 'regional' ? t('cacheRegional')
+              : t('cacheOther');
+          var first = group.items[0];
+          return h('div', { key: 'cache-' + index, className: '__fd_cacheRow' },
+            h('span', {
+              className: '__fd_dot ' + (group.kind === 'other' ? '__fd_dotInfo' : '__fd_dotWarn'),
+            }),
+            h('div', { className: '__fd_findingBody' },
+              h('div', { className: '__fd_findingTitle' },
+                kindText.replace('{n}', String(group.items.length)),
+                group.cache.egress && group.cache.egress.ip
+                  ? h('span', { className: '__fd_tag' }, t('cacheEgress').replace('{ip}', group.cache.egress.ip))
+                  : null),
+              first && first.detail
+                ? h('div', { className: '__fd_hint __fd_mid' }, String(first.detail).slice(0, 220))
+                : null,
+              group.items.length > 1
+                ? h('div', { className: '__fd_url' },
+                    group.items.map(function (row) { return row.id; }).slice(0, 6).join('、') +
+                    (group.items.length > 6 ? ' …' : ''))
+                : null));
+        }));
     }
 
     /* ------------------------------------------------------------------ *
@@ -1144,17 +1239,61 @@ window.__ModuleLoader__.load({
           ? h('div', { className: '__fd_billing' },
               h('p', { className: '__fd_billingText' },
                 t('billingHint').replace('{n}', String(billing.length))),
+              /* 从渠道插件那儿真实读来的余额/积分——浏览器侧直接取，
+                 因为那些接口认的是浏览器会话，Host 拿不到。 */
+              h(BillingPanel, { t: t, billing: props.billing, onRefresh: props.onRefreshBilling }),
               h('div', { className: '__fd_actions' },
                 h('button', {
                   type: 'button',
-                  className: '__fd_primary',
                   onClick: function () {
-                    // 跳到提供这些免费车道的插件页：余额/积分/账号都在那里。
                     if (props.onOpenBilling) props.onOpenBilling();
                   },
                 }, t('openBilling')),
                 h('span', { className: '__fd_hint' }, t('billingWhere'))))
           : null);
+    }
+
+    /**
+     * 账单/积分小面板。
+     *
+     * 数据来自渠道插件自己的 API（客户端直接 fetch，带浏览器会话）。
+     * 那个插件没装、没登录、或改了接口，这里都只是安静地不显示——
+     * 框架医生的核心功能不该因为读不到别家的账单而受影响。
+     */
+    function BillingPanel(props) {
+      var t = props.t;
+      var billing = props.billing || { status: 'idle', snapshot: null, summary: null, error: '' };
+      var summary = billing.summary;
+
+      if (billing.status === 'loading') {
+        return h('p', { className: '__fd_hint' }, t('billingLoading'));
+      }
+      if (billing.status === 'error' || !summary || !summary.hasData) {
+        return h('div', { className: '__fd_actions' },
+          h('span', { className: '__fd_hint' },
+            t('billingUnavailable') + (summary && summary.error ? '：' + summary.error : '')),
+          h('button', { type: 'button', onClick: props.onRefresh }, t('billingRefresh')));
+      }
+
+      var parts = [];
+      if (summary.totalCredits !== null) {
+        parts.push(t('billingCredits').replace('{n}', String(summary.totalCredits)));
+      }
+      if (summary.totalDollars !== null) {
+        parts.push(t('billingDollars').replace('{n}', String(summary.totalDollars)));
+      }
+      if (parts.length === 0) {
+        parts.push(t('billingAccounts').replace('{n}', String(summary.accounts)));
+      }
+
+      return h('div', { className: '__fd_billingRow' },
+        h('span', { className: '__fd_billingLabel' }, summary.label || ''),
+        h('span', null, parts.join(' · ')),
+        summary.lowCount > 0
+          ? h('span', { className: '__fd_chip __fd_chipWarn' },
+              t('billingLow').replace('{n}', String(summary.lowCount)))
+          : null,
+        h('button', { type: 'button', onClick: props.onRefresh }, t('billingRefresh')));
     }
 
     /* ------------------------------------------------------------------ *
@@ -1327,6 +1466,44 @@ window.__ModuleLoader__.load({
       var repair = repairPair[0], setRepair = repairPair[1];
       var chatPair = react.useState({ messages: [], status: 'idle', error: '', actionResults: {} });
       var chat = chatPair[0], setChat = chatPair[1];
+      var billingPair = react.useState({ status: 'idle', snapshot: null, summary: null, error: '' });
+      var billing = billingPair[0], setBilling = billingPair[1];
+
+      /**
+       * 读渠道插件的余额/积分。
+       *
+       * 必须在**浏览器侧**做：那些插件的接口用 harness 的 connection 围栏
+       * 鉴权，认的是浏览器会话 cookie（Host 端裸请求一律 401，我实测过）。
+       * 我们这份代码本来就跑在浏览器里，直接 fetch 就能过。
+       */
+      function loadBilling() {
+        setBilling(function (previous) {
+          return Object.assign({}, previous, { status: 'loading' });
+        });
+        // 动态 import：这个模块只在需要时才解析，减少首屏体积。
+        return import('./lib/billing-client.js')
+          .then(function (mod) {
+            var providers = Array.isArray(mod.BILLING_PROVIDERS) ? mod.BILLING_PROVIDERS : [];
+            if (providers.length === 0) {
+              setBilling({ status: 'idle', snapshot: null, summary: null, error: '' });
+              return null;
+            }
+            return mod.readBilling(providers[0], { baseURI: document.baseURI }).then(function (snapshot) {
+              setBilling({
+                status: snapshot.ok ? 'ready' : 'error',
+                snapshot: snapshot,
+                summary: mod.summarizeBilling(snapshot),
+                error: snapshot.error || '',
+              });
+              return null;
+            });
+          })
+          .catch(function (error) {
+            setBilling({ status: 'error', snapshot: null, summary: null, error: humanError(t, error) });
+            return null;
+          });
+      }
+
 
       function refreshState() {
         return api('/state').then(function (data) {
@@ -1512,6 +1689,8 @@ window.__ModuleLoader__.load({
       react.useEffect(function () {
         refreshState();
         runDiagnose();
+        // 余额/积分从渠道插件那儿读（浏览器侧，带会话），失败也不影响主流程。
+        loadBilling();
         if (props.locale && typeof props.locale.subscribe === 'function') {
           return props.locale.subscribe(function () { bump(function (value) { return value + 1; }); });
         }
@@ -1561,9 +1740,12 @@ window.__ModuleLoader__.load({
         h(Boundary, { t: t, title: t('sectionDiagnose') },
           h(DiagnoseSection, {
             t: t, diag: diag, counts: counts, score: score, data: data,
+            channelCache: Array.isArray(data.channelCache) ? data.channelCache : [],
+            billing: billing,
             onRun: runDiagnose,
             onRepairOne: function (id) { runRepair([id]); },
             onOpenBilling: openBilling,
+            onRefreshBilling: loadBilling,
           })),
 
         h(Boundary, { t: t, title: t('sectionChat') },

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **Reads channel plugins, across two access models** — availability verdicts are
+  read by the Host straight off disk (`$DSH_HOME/our-free-model/availability.json`),
+  so the report carries what the endpoint itself said — "flagged as abusive
+  traffic", "not available in your country", plus the egress IP — instead of a
+  bare 429. Live balance is read by the browser, because those endpoints sit
+  behind the connection fence and answer 401 to a Host request, while this
+  plugin's page carries the same session cookie. Both paths degrade quietly when
+  the channel plugin is absent or changed.
+- New `channel-cache` info tool and a channel-cache panel; billing panel with a
+  refresh control.
+
 - **A model of its own, with a fallback chain** — the chat section no longer has
   to share your default model. `config.model.chain` is an ordered list the
   doctor walks through, hopping to the next entry whenever one fails, so a 429
