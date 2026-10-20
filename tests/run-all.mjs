@@ -15,6 +15,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const SUITES = [
   ['lib', 'framework-doctor-lib.mjs'],
   ['failover', 'framework-doctor-failover.mjs'],
+  ['realworld', 'framework-doctor-realworld.mjs'],
   ['model-chain', 'framework-doctor-model-chain.mjs'],
   ['channel-state', 'framework-doctor-channel-state.mjs'],
   ['host', 'framework-doctor-host.mjs'],
