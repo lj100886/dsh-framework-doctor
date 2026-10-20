@@ -109,19 +109,29 @@ Selection is conservative:
 3. If neither exists, the error is left terminal — it is not silently swapped for
    a different model.
 
-A failed route enters a cooldown (default 60s) so the retry cannot bounce back to
-the channel that just failed. The override is cleared when the turn finishes, so
-the next turn returns to your own model choice. Errors that a different channel
-cannot fix — `INVALID_CREDENTIAL`, `MISSING_CREDENTIAL`, `UNKNOWN_MODEL`, HTTP
-400/401 — never trigger a failover.
+A failed route enters a cooldown, but the length is **derived from the error**, not
+fixed: quota exhaustion waits far longer than a rate limit, and a gateway 5xx or a
+network blip is retried sooner. An endpoint's own `Retry-After` always wins; if it
+says "retry in a second", the plugin retries in place rather than switching
+channels. Repeated failures on the same route double its cooldown, and one success
+clears the record.
 
-Disable it (or tune the cooldown) in the row config:
+Every failure is also recorded as a channel health record — error type, severity,
+whether it looks like a billing/quota problem, consecutive count, and remaining
+cooldown. The chat section can read it through the `channel-health` tool and
+answer "which channel is broken, how badly, do I need to top up, and roughly when
+will it recover". The reasoning stays in the chat: the retry path itself never
+calls a model (it runs on the failure path, where a model call could deadlock and
+would add latency), so failover decisions are deterministic and instant while the
+explanations are written by the model afterwards.
+
+Disable it (or cap the cooldown) in the row config:
 
 ```yaml
 - id: framework-doctor
   config:
     failover: true
-    failoverCooldownMs: 60000
+    failoverMaxCooldownMs: 3600000
 ```
 
 ## Install

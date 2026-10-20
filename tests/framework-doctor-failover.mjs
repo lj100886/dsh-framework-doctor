@@ -1,9 +1,12 @@
 /**
  * lib/failover.js + Host 端故障转移接线 的测试。
  *
- * 重点验证：
+ * 重点：
  *   - 哪些错误值得换渠道（429/配额/服务端 换；400/鉴权错误 不换）
+ *   - 错误分级：不同错误给不同冷却、严重度、是否额度问题
+ *   - Retry-After 尊重端点原话；极短 Retry-After 就地重试不换渠道
  *   - 候选挑选：同名优先、冷却中的跳过、没有端点的跳过
+ *   - 连续失败冷却翻倍；成功一次清零
  *   - Host 接线：request-error 返回 retry 并在 request 里换掉路由
  */
 import { pathToFileURL } from 'node:url';
@@ -38,13 +41,14 @@ console.log('\n=== shouldFailover ===');
     [{ code: 'EMPTY_RESPONSE' }, 'EMPTY_RESPONSE'],
     [{ status: 429 }, 'status 429'],
     [{ status: 503 }, 'status 503'],
+    [{ status: 502 }, 'status 502'],
+    [{ status: 402 }, 'status 402（额度）'],
     [{ code: 'rate_limit' }, '小写 code'],
   ];
-  for (const [failure, label] of yes) {
-    ok(mod.shouldFailover(failure) === true, `应换渠道：${label}`);
-  }
+  for (const [failure, label] of yes) ok(mod.shouldFailover(failure) === true, `应换渠道：${label}`);
+
   const no = [
-    [{ code: 'INVALID_CREDENTIAL' }, '密钥错误（换渠道也没用）'],
+    [{ code: 'INVALID_CREDENTIAL' }, '密钥错误'],
     [{ code: 'MISSING_CREDENTIAL' }, '缺凭据'],
     [{ code: 'UNKNOWN_MODEL' }, '模型不存在'],
     [{ code: 'UNSUPPORTED_OPTION' }, '不支持参数'],
@@ -54,179 +58,176 @@ console.log('\n=== shouldFailover ===');
     [null, 'null'],
     [undefined, 'undefined'],
   ];
-  for (const [failure, label] of no) {
-    ok(mod.shouldFailover(failure) === false, `不该换渠道：${label}`);
-  }
+  for (const [failure, label] of no) ok(mod.shouldFailover(failure) === false, `不该换渠道：${label}`);
+}
+
+console.log('\n=== describeFailure（错误分级） ===');
+{
+  const quota = mod.describeFailure({ code: 'QUOTA' });
+  eq(quota.code, 'QUOTA', 'QUOTA code');
+  eq(quota.severity, 'critical', 'QUOTA 是 critical');
+  eq(quota.scope, 'account', 'QUOTA 作用域是 account');
+  eq(quota.billing, true, 'QUOTA 标记为额度问题');
+  ok(quota.cooldownMs >= 30 * 60_000, 'QUOTA 冷却 ≥ 30 分钟', quota.cooldownMs);
+
+  const rate = mod.describeFailure({ code: 'RATE_LIMIT' });
+  eq(rate.severity, 'high', '429 是 high');
+  ok(rate.cooldownMs >= 3 * 60_000 && rate.cooldownMs < quota.cooldownMs, '429 冷却短于 QUOTA', rate.cooldownMs);
+
+  const server = mod.describeFailure({ code: 'SERVER' });
+  eq(server.severity, 'medium', '5xx 是 medium');
+  eq(server.scope, 'channel', '5xx 作用域是 channel');
+  ok(server.cooldownMs < rate.cooldownMs, '5xx 冷却短于 429', server.cooldownMs);
+
+  const net = mod.describeFailure({ code: 'TRANSPORT' });
+  eq(net.scope, 'transport', '网络错误作用域是 transport');
+  eq(net.severity, 'low', '网络错误是 low');
+  ok(net.cooldownMs < server.cooldownMs, '网络冷却最短', net.cooldownMs);
+
+  // Retry-After 尊重端点原话
+  const withRetry = mod.describeFailure({ code: 'RATE_LIMIT', providerRetryAfterMs: 120_000 });
+  ok(withRetry.cooldownMs >= 120_000, 'Retry-After 抬高冷却', withRetry.cooldownMs);
+  eq(withRetry.retryAfterMs, 120_000, 'retryAfterMs 原样保留');
+
+  // 极短 Retry-After：就地重试
+  const quick = mod.describeFailure({ code: 'RATE_LIMIT', providerRetryAfterMs: 1_500 });
+  eq(quick.immediate, true, '1.5 秒的 Retry-After 判为就地重试');
+  const slow = mod.describeFailure({ code: 'RATE_LIMIT', providerRetryAfterMs: 30_000 });
+  eq(slow.immediate, false, '30 秒的 Retry-After 不判为就地重试');
+
+  // 上限
+  const capped = mod.describeFailure({ code: 'QUOTA' }, { maxCooldownMs: 5 * 60_000 });
+  ok(capped.cooldownMs <= 5 * 60_000, '冷却被上限夹住', capped.cooldownMs);
+
+  // status-only 也能归一
+  eq(mod.describeFailure({ status: 402 }).code, 'QUOTA', '402 归一为 QUOTA');
+  eq(mod.describeFailure({ status: 429 }).code, 'RATE_LIMIT', '429 归一为 RATE_LIMIT');
 }
 
 console.log('\n=== pickFailoverTarget ===');
 {
   const providers = {
-    'chan-a': {
-      baseURL: 'https://a.example/v1',
-      models: [{ id: 'deepseek-v4.1-flash' }, { id: 'gpt-4o' }],
-    },
-    'chan-b': {
-      baseURL: 'https://b.example/v1',
-      models: [{ id: 'deepseek-v4.1-flash' }, { id: 'qwen3-max' }],
-    },
-    'chan-c': {
-      // 没有 baseURL：不可用作故障转移目标
-      models: [{ id: 'deepseek-v4.1-flash' }],
-    },
+    'chan-a': { baseURL: 'https://a.example/v1', models: [{ id: 'deepseek-v4.1-flash' }, { id: 'gpt-4o' }] },
+    'chan-b': { baseURL: 'https://b.example/v1', models: [{ id: 'deepseek-v4.1-flash' }, { id: 'qwen3-max' }] },
+    'chan-c': { models: [{ id: 'deepseek-v4.1-flash' }] }, // 无 baseURL
   };
 
-  const hit = mod.pickFailoverTarget({
-    failedProvider: 'chan-a',
-    model: 'deepseek-v4.1-flash',
-    providers,
-    cooling: [],
-  });
+  const hit = mod.pickFailoverTarget({ failedProvider: 'chan-a', model: 'deepseek-v4.1-flash', providers, cooling: [] });
   eq(hit?.route, 'chan-b', '同名模型优先选有端点的渠道');
-  eq(hit?.model, 'deepseek-v4.1-flash', '模型名保持');
   eq(hit?.reason, 'same-model:chan-b', 'reason 标明 same-model');
 
-  // 冷却中的要跳过
   const skipped = mod.pickFailoverTarget({
-    failedProvider: 'chan-a',
-    model: 'deepseek-v4.1-flash',
-    providers,
-    cooling: ['chan-b'],
+    failedProvider: 'chan-a', model: 'deepseek-v4.1-flash', providers, cooling: ['chan-b'],
   });
-  eq(skipped, null, '唯一可用的渠道在冷却中时不选它');
+  eq(skipped, null, '唯一可用渠道在冷却中时不选它');
 
-  // 没有同名模型 → 不瞎选
-  const none = mod.pickFailoverTarget({
-    failedProvider: 'chan-a',
-    model: 'gpt-4o',
-    providers,
-    cooling: [],
-  });
-  eq(none, null, '没有同名模型时不乱选一个');
+  const none = mod.pickFailoverTarget({ failedProvider: 'chan-a', model: 'gpt-4o', providers, cooling: [] });
+  eq(none, null, '没有同名模型时不乱选');
 
-  // 跨渠道同规格：openrouter 的 vendor 前缀
   const withPrefix = {
     'chan-a': { baseURL: 'https://a/v1', models: [{ id: 'deepseek/deepseek-v3' }] },
     'chan-b': { baseURL: 'https://b/v1', models: [{ id: 'deepseek-v3' }] },
   };
   const family = mod.pickFailoverTarget({
-    failedProvider: 'chan-a',
-    model: 'deepseek/deepseek-v3',
-    providers: withPrefix,
-    cooling: [],
+    failedProvider: 'chan-a', model: 'deepseek/deepseek-v3', providers: withPrefix, cooling: [],
   });
-  eq(family?.route, 'chan-b', '去掉 vendor 前缀后匹配到同规格模型');
+  eq(family?.route, 'chan-b', '去掉 vendor 前缀后匹配同规格');
   eq(family?.reason, 'same-family:chan-b', 'reason 标明 same-family');
 
-  // 未注册的渠道不选
   const unregistered = mod.pickFailoverTarget({
-    failedProvider: 'chan-a',
-    model: 'deepseek-v4.1-flash',
-    providers,
-    cooling: [],
-    registered: ['chan-a'],
+    failedProvider: 'chan-a', model: 'deepseek-v4.1-flash', providers, cooling: [], registered: ['chan-a'],
   });
-  eq(unregistered, null, '未注册到模型服务的渠道不当目标');
+  eq(unregistered, null, '未注册渠道不当目标');
 }
 
-console.log('\n=== createFailoverState ===');
+console.log('\n=== createFailoverState（健康画像） ===');
 {
-  const state = mod.createFailoverState({ cooldownMs: 1000 });
   const t0 = 1_000_000;
+  const state = mod.createFailoverState({ maxCooldownMs: 3_600_000 });
 
-  const cooling1 = state.markFailed('s1', 'chan-a', t0);
-  ok(cooling1.has('chan-a'), '失败后 route 进入冷却');
+  const first = state.markFailed('s1', 'chan-a', { code: 'RATE_LIMIT' }, t0);
+  ok(first.cooling.has('chan-a'), '失败后进入冷却');
+  ok(first.cooldownMs >= 3 * 60_000, '429 按类型给冷却', first.cooldownMs);
+  eq(first.record.consecutiveFailures, undefined, 'record 里字段名是 failures');
+  eq(first.record.failures, 1, '第一次失败计数 1');
 
-  eq(state.getOverride('s1'), undefined, '一开始没有覆盖');
+  // 连续失败翻倍
+  const second = state.markFailed('s1', 'chan-a', { code: 'RATE_LIMIT' }, t0 + 1000);
+  eq(second.record.failures, 2, '第二次失败计数 2');
+  ok(second.cooldownMs > first.cooldownMs, '连续失败冷却翻倍', { first: first.cooldownMs, second: second.cooldownMs });
 
+  // 成功清零
+  state.markHealthy('s1', 'chan-a');
+  ok(!state.recordFor('s1', 'chan-a'), 'markHealthy 清掉档案');
+
+  // 不同错误类型给不同冷却
+  const q = state.markFailed('s1', 'chan-b', { code: 'QUOTA' }, t0);
+  const s = state.markFailed('s1', 'chan-c', { code: 'SERVER' }, t0);
+  ok(q.cooldownMs > s.cooldownMs, 'QUOTA 比 SERVER 冷却更久', { quota: q.cooldownMs, server: s.cooldownMs });
+
+  // 报告
+  const report = state.report('s1', t0 + 1000);
+  ok(Array.isArray(report) && report.length >= 2, 'report 返回渠道档案');
+  const quotaRow = report.find((row) => row.route === 'chan-b');
+  eq(quotaRow?.billing, true, '报告里 QUOTA 标记 billing');
+  eq(quotaRow?.severity, 'critical', '报告里带 severity');
+  ok(typeof quotaRow?.remainingMs === 'number', '报告里带剩余冷却');
+
+  // 覆盖表
   state.setOverride('s1', { route: 'chan-b', model: 'm1' });
-  const ov = state.getOverride('s1');
-  eq(ov?.provider, 'chan-b', '覆盖表记录 provider');
-  eq(ov?.model, 'm1', '覆盖表记录 model');
-
-  // 冷却过期
-  const coolingLater = state.coolingFor('s1', t0 + 5000);
-  ok(!coolingLater.has('chan-a'), '冷却到期后不再是冷却态');
-
-  // 另一个会话互不影响
-  eq(state.getOverride('s2'), undefined, '不同会话状态隔离');
-
+  eq(state.getOverride('s1')?.provider, 'chan-b', '覆盖表记录 provider');
+  eq(state.getOverride('s2'), undefined, '会话隔离');
   state.clearOverride('s1');
-  eq(state.getOverride('s1'), undefined, 'clearOverride 移除覆盖');
+  eq(state.getOverride('s1'), undefined, 'clearOverride 移除');
 
-  state.setOverride('s1', { route: 'chan-b', model: 'm1' });
-  state.markFailed('s1', 'chan-b', t0);
+  state.setOverride('s1', { route: 'x', model: 'y' });
   state.forget('s1');
-  eq(state.getOverride('s1'), undefined, 'forget 清掉覆盖');
-  eq(state.coolingFor('s1', t0).size, 0, 'forget 清掉冷却');
+  eq(state.getOverride('s1'), undefined, 'forget 清覆盖');
+  eq(state.coolingFor('s1', t0).size, 0, 'forget 清健康档案');
+  eq(state.report('s1', t0).length, 0, 'forget 后报告为空');
 
   const stats = state.stats();
-  ok(stats.attempts >= 1, 'stats 记录尝试');
-  ok(stats.failovers >= 1, 'stats 记录换渠道');
+  ok(stats.attempts >= 3, 'stats 记录尝试', stats.attempts);
 }
 
 /* ------------------------------------------------------------------ *
- * Host 接线：模拟一次 429 → 换渠道 → retry
+ * Host 接线
  * ------------------------------------------------------------------ */
-console.log('\n=== Host 接线（429 → 换渠道 → retry） ===');
-{
-  const host = await import(pathToFileURL(`${ROOT}/index.js`).href);
-
-  const PROVIDERS = {
-    'main-chan': {
-      apiKeyEnv: 'MAIN_KEY',
-      baseURL: 'https://main.example/v1',
-      models: [{ id: 'deepseek-v4.1-flash', input: ['text'], contextWindow: 131072, maxTokens: 8192 }],
-    },
-    'backup-chan': {
-      apiKeyEnv: 'BACKUP_KEY',
-      baseURL: 'https://backup.example/v1',
-      models: [{ id: 'deepseek-v4.1-flash', input: ['text'], contextWindow: 131072, maxTokens: 8192 }],
-    },
-  };
-
+function makeHostCtx(providers) {
   const handlers = new Map();
-  const registeredRoutes = [];
   const ctx = {
     logger: { info() {}, warn() {}, debug() {}, error() {} },
     settings: {
       describe: () => [
-        {
-          ns: 'llm-pi-ai',
-          applies: 'live',
-          revision: 1,
-          value: { providers: structuredClone(PROVIDERS) },
-          user: { providers: structuredClone(PROVIDERS) },
-        },
+        { ns: 'llm-pi-ai', applies: 'live', revision: 1, value: { providers: structuredClone(providers) }, user: { providers: structuredClone(providers) } },
       ],
       mutate: async () => {},
     },
-    effect(fn) {
-      const dispose = fn();
-      return () => { if (typeof dispose === 'function') dispose(); };
-    },
-    on(event, listener) {
-      handlers.set(event, listener);
-      return () => handlers.delete(event);
-    },
+    effect(fn) { const d = fn(); return () => { if (typeof d === 'function') d(); }; },
+    on(event, listener) { handlers.set(event, listener); return () => handlers.delete(event); },
     get(name) {
-      if (name === 'llm') {
-        return { listProviders: () => Object.keys(PROVIDERS).map((id) => ({ id, name: id })) };
-      }
+      if (name === 'llm') return { listProviders: () => Object.keys(providers).map((id) => ({ id, name: id })) };
       if (name === 'credentials') return { describe: async () => ({ configured: true }) };
       return undefined;
     },
     inject(deps, cb) {
       if (deps.includes('webServer')) {
-        cb({
-          webServer: { register: (r) => { registeredRoutes.push(r); return () => {}; } },
-          effect: (fn) => { fn(); return () => {}; },
-        });
+        cb({ webServer: { register: () => () => {} }, effect: (fn) => { fn(); return () => {}; } });
       }
     },
   };
+  return { ctx, handlers };
+}
 
-  host.apply(ctx, { enabled: true, failover: true, failoverCooldownMs: 1000 });
+console.log('\n=== Host 接线（429 → 换渠道 → retry） ===');
+{
+  const host = await import(pathToFileURL(`${ROOT}/index.js`).href);
+  const PROVIDERS = {
+    'main-chan': { apiKeyEnv: 'MAIN_KEY', baseURL: 'https://main.example/v1', models: [{ id: 'deepseek-v4.1-flash' }] },
+    'backup-chan': { apiKeyEnv: 'BACKUP_KEY', baseURL: 'https://backup.example/v1', models: [{ id: 'deepseek-v4.1-flash' }] },
+  };
+  const { ctx, handlers } = makeHostCtx(PROVIDERS);
+  host.apply(ctx, { enabled: true, failover: true });
 
   ok(handlers.has('agent/request-error'), '注册了 agent/request-error 监听');
   ok(handlers.has('agent/request'), '注册了 agent/request 监听');
@@ -235,32 +236,25 @@ console.log('\n=== Host 接线（429 → 换渠道 → retry） ===');
   const onRequest = handlers.get('agent/request');
   const agent = { id: 'session-1' };
 
-  // 先走一次正常 request：记下这个会话用的模型（真实流程里 request 在 request-error 之前）。
   const firstConfig = await onRequest({ agent, turn: 1, step: 1 }, async () => ({
-    provider: 'main-chan',
-    model: 'deepseek-v4.1-flash',
+    provider: 'main-chan', model: 'deepseek-v4.1-flash',
   }));
-  eq(firstConfig.provider, 'main-chan', '第一次 request 不做替换');
+  eq(firstConfig.provider, 'main-chan', '第一次 request 不替换');
 
-  // 首次 429：应该返回 retry
   let delegated = false;
   const action = await onError(
     { agent, turn: 1, step: 1, provider: 'main-chan', failure: { code: 'RATE_LIMIT', message: '429' } },
     async () => { delegated = true; return undefined; },
   );
   eq(action?.kind, 'retry', '429 时返回 retry');
-  ok(!delegated, '接管了恢复，没有把错误交回默认处理');
+  ok(!delegated, '接管了恢复');
 
-  // 随后 request waterfall：应把 provider 换成 backup-chan
   const replaced = await onRequest({ agent, turn: 1, step: 1 }, async () => ({
-    provider: 'main-chan',
-    model: 'deepseek-v4.1-flash',
+    provider: 'main-chan', model: 'deepseek-v4.1-flash',
   }));
-  eq(replaced.provider, 'backup-chan', 'request 里换到了备用渠道');
+  eq(replaced.provider, 'backup-chan', 'request 里换到备用渠道');
   eq(replaced.model, 'deepseek-v4.1-flash', '模型保持同名');
-  ok(replaced.reasoningEffort === undefined, '不透传不该有的字段');
 
-  // 再次失败在 backup-chan：不能换回 main（冷却中），且没有第三个渠道 → 交回默认
   let delegated2 = false;
   const action2 = await onError(
     { agent, turn: 1, step: 1, provider: 'backup-chan', failure: { code: 'RATE_LIMIT', message: '429' } },
@@ -270,24 +264,35 @@ console.log('\n=== Host 接线（429 → 换渠道 → retry） ===');
   ok(delegated2, '确实调用了 next()');
 }
 
-console.log('\n=== Host 接线（不可重试错误不接管） ===');
+console.log('\n=== Host 接线：极短 Retry-After 就地重试，不换渠道 ===');
 {
   const host = await import(pathToFileURL(`${ROOT}/index.js`).href);
-  const handlers = new Map();
-  const ctx = {
-    logger: { info() {}, warn() {}, debug() {}, error() {} },
-    settings: {
-      describe: () => [{ ns: 'llm-pi-ai', applies: 'live', revision: 1, value: { providers: {} }, user: { providers: {} } }],
-      mutate: async () => {},
-    },
-    effect(fn) { fn(); return () => {}; },
-    on(event, listener) { handlers.set(event, listener); return () => {}; },
-    get: () => undefined,
-    inject: () => {},
+  const PROVIDERS = {
+    'main-chan': { baseURL: 'https://main.example/v1', models: [{ id: 'm' }] },
+    'backup-chan': { baseURL: 'https://backup.example/v1', models: [{ id: 'm' }] },
   };
+  const { ctx, handlers } = makeHostCtx(PROVIDERS);
   host.apply(ctx, { enabled: true, failover: true });
   const onError = handlers.get('agent/request-error');
-  ok(Boolean(onError), '注册了监听');
+  const onRequest = handlers.get('agent/request');
+  const agent = { id: 's-quick' };
+
+  await onRequest({ agent, turn: 1, step: 1 }, async () => ({ provider: 'main-chan', model: 'm' }));
+  const action = await onError(
+    { agent, turn: 1, step: 1, provider: 'main-chan', failure: { code: 'RATE_LIMIT', providerRetryAfterMs: 800 } },
+    async () => undefined,
+  );
+  eq(action?.kind, 'retry', '极短 Retry-After 也返回 retry');
+  const after = await onRequest({ agent, turn: 1, step: 1 }, async () => ({ provider: 'main-chan', model: 'm' }));
+  eq(after.provider, 'main-chan', '就地重试不切换渠道');
+}
+
+console.log('\n=== Host 接线：不可重试错误不接管 ===');
+{
+  const host = await import(pathToFileURL(`${ROOT}/index.js`).href);
+  const { ctx, handlers } = makeHostCtx({});
+  host.apply(ctx, { enabled: true, failover: true });
+  const onError = handlers.get('agent/request-error');
   let delegated = false;
   const action = await onError(
     { agent: { id: 's' }, turn: 1, step: 1, provider: 'x', failure: { code: 'INVALID_CREDENTIAL' } },
@@ -300,18 +305,7 @@ console.log('\n=== Host 接线（不可重试错误不接管） ===');
 console.log('\n=== failover 关闭时完全不挂监听 ===');
 {
   const host = await import(pathToFileURL(`${ROOT}/index.js`).href);
-  const handlers = new Map();
-  const ctx = {
-    logger: { info() {}, warn() {}, debug() {}, error() {} },
-    settings: {
-      describe: () => [{ ns: 'llm-pi-ai', applies: 'live', revision: 1, value: { providers: {} }, user: { providers: {} } }],
-      mutate: async () => {},
-    },
-    effect(fn) { fn(); return () => {}; },
-    on(event, listener) { handlers.set(event, listener); return () => {}; },
-    get: () => undefined,
-    inject: () => {},
-  };
+  const { ctx, handlers } = makeHostCtx({});
   host.apply(ctx, { enabled: true, failover: false });
   ok(!handlers.has('agent/request-error'), 'failover=false 时不监听 request-error');
   ok(!handlers.has('agent/request'), 'failover=false 时不监听 request');

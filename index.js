@@ -50,7 +50,9 @@ function normalizeConfig(config) {
     probeTimeoutMs: clampInt(raw.probeTimeoutMs, 3_000, 60_000, 15_000),
     // 会话级故障转移：默认开。关掉它，模型 429 时就是原样报错。
     failover: raw.failover !== false,
-    failoverCooldownMs: clampInt(raw.failoverCooldownMs, 5_000, 600_000, 60_000),
+    // 冷却时长由错误类型决定（QUOTA 30 分钟 / 429 3 分钟 / 5xx 1 分钟 / 网络抖动更短），
+    // 这里只给一个上限，避免某个渠道被永久晾着。
+    failoverMaxCooldownMs: clampInt(raw.failoverMaxCooldownMs, 60_000, 6 * 3_600_000, 3_600_000),
   };
 }
 
@@ -355,9 +357,17 @@ function apply(ctx, config) {
   const loadInfer = () => load('infer', () => import('./lib/infer.js'));
   const loadDiagnose = () => load('diagnose', () => import('./lib/diagnose.js'));
   const loadRepair = () => load('repair', () => import('./lib/repair.js'));
+  const loadFailover = () => load('failover', () => import('./lib/failover.js'));
 
   /** 最近一次扫描结果，供 /state 与页面首屏使用。 */
   let lastScan = null;
+
+  /**
+   * 故障转移的健康画像。放这么高是因为它同时被两处读：
+   *   - request-error / request 两个 waterfall（热路径）；
+   *   - /state 与对话助手（写报告："哪些渠道挂了、挂到什么程度、要不要充值"）。
+   */
+  let failoverState = null;
 
   /** 探测超时：页面请求可能中途断开，但探测本身要有自己的上限。 */
   function probeSignal(outerSignal) {
@@ -503,6 +513,7 @@ function apply(ctx, config) {
     ['tools', '{}', '这个智能体现在能调用哪些工具（名字 + 说明）'],
     ['provider', '{"route":"配置名"}', '某个 provider 的完整配置（密钥已脱敏）'],
     ['probe', '{"baseURL":"https://...","api":"可选","apiKey":"可选"}', '实时访问一个端点，返回它公布的模型清单与推导出的能力'],
+    ['channel-health', '{}', '各渠道最近的失败档案：错误类型、连续失败次数、严重度、是否额度问题、冷却到什么时候。写"哪个渠道坏了 / 要不要充值 / 什么时候恢复"这类报告时用它'],
   ];
 
   /** 执行一次信息工具，返回给模型看的纯文本。任何失败都变成可读文本，不抛。 */
@@ -605,6 +616,31 @@ function apply(ctx, config) {
         return lines.join('\n');
       }
 
+      if (tool === 'channel-health') {
+        if (!failoverState) return '故障转移未启用（failover: false），没有渠道健康数据。';
+        const rows = failoverState.report();
+        if (rows.length === 0) return '还没有任何渠道失败记录——所有渠道都正常。';
+        const lines = [`共 ${rows.length} 条渠道失败档案（按连续失败次数排序）：`];
+        for (const row of rows) {
+          const state = row.cooling
+            ? `冷却中，还剩 ${Math.ceil(row.remainingMs / 1000)} 秒`
+            : '已过冷却，可以再试';
+          lines.push(
+            `- ${row.route}：${row.code}｜严重度 ${row.severity}｜作用域 ${row.scope}｜` +
+              `连续失败 ${row.consecutiveFailures} 次｜${state}` +
+              (row.billing ? '｜额度或计费问题' : '') +
+              (row.retryAfterMs ? `｜端点要求 ${Math.round(row.retryAfterMs / 1000)} 秒后再试` : ''),
+          );
+          lines.push(`  最近一次：${row.lastFailureAt}（会话 ${row.sessionId}）`);
+        }
+        lines.push('');
+        lines.push(
+          '判断提示：scope=account 且 billing=true 通常是额度用完，重试没用，该提醒用户充值或换套餐；' +
+            'scope=channel 且连续失败多次说明该端点真的不稳；scope=transport 多半是本地网络。',
+        );
+        return lines.join('\n');
+      }
+
       return `未知的信息工具 "${tool}"。可用的：${INFO_TOOLS.map((t) => t[0]).join('、')}`;
     } catch (error) {
       return `工具 ${tool} 执行出错：${messageOf(error)}`;
@@ -689,6 +725,16 @@ function apply(ctx, config) {
       '   - `probe | {"baseURL":"https://...","apiKey":"可选密钥"}`：探测一个端点并列出模型；',
       '   - `apply-probe | {"route":"配置名","baseURL":"https://...","apiKey":"可选密钥"}`：把探测结果写入配置。',
       '   这些动作是给用户点的按钮，写操作只有用户按下才会执行。用户没说要做动作就不要输出 ACTIONS 段。',
+      '',
+      '关于渠道故障（用户问"哪个渠道挂了/还能不能用/要不要充值"时）：',
+      '- 先用 `channel-health` 工具拿失败档案，必要时再配合 `state` / `probe` 查证；',
+      '- 判断这几件事，并分别说清：',
+      '  · **坏到什么程度**：连续失败次数、错误类型（额度 / 限流 / 端点故障 / 网络）、涉及一个渠道还是多个；',
+      '  · **要不要用户介入**：`billing=true`（额度或计费）基本只能靠用户充值/换套餐，直接说清楚，并可以提示大概该充哪家的；',
+      '    端点故障或网络问题通常自己会恢复，告诉用户"再等等"比让他动手更有用；',
+      '  · **大概什么时候能恢复**：按冷却剩余时间和错误类型给一个区间，不要编一个精确时间；',
+      '  · **现在还能不能用**：明确告诉用户当前有没有可用渠道、框架医生已经自动切到哪了、他自己的模型选择还保不保得住；',
+      '- 不要建议用户去改 `failover` 的冷却参数——那是插件按错误类型自动决定的，不是用户该调的东西。',
       '',
       `当前默认模型：${selection.provider} / ${selection.model}`,
       '',
@@ -1284,7 +1330,12 @@ function apply(ctx, config) {
         lastScanAt: lastScan?.scannedAt ?? null,
         health: lastScan?.health ?? null,
         summary: lastScan?.summary ?? null,
-        config: { autoScan: cfg.autoScan, scanIntervalMs: cfg.scanIntervalMs },
+        channelHealth: failoverState ? failoverState.report() : [],
+        config: {
+          failover: cfg.failover,
+          failoverMaxCooldownMs: cfg.failoverMaxCooldownMs,
+          probeTimeoutMs: cfg.probeTimeoutMs,
+        },
       });
       return;
     }
@@ -1418,7 +1469,6 @@ function apply(ctx, config) {
 
   if (cfg.failover) {
     ctx.effect(() => {
-      let state = null;
       let disposed = false;
 
       // 懒加载：failover 模块坏了不能连累插件本体起来。
@@ -1427,13 +1477,13 @@ function apply(ctx, config) {
           logger?.warn?.(`[framework-doctor] failover disabled: ${loaded.error}`);
           return null;
         }
-        state = loaded.mod.createFailoverState({ cooldownMs: cfg.failoverCooldownMs });
+        failoverState = loaded.mod.createFailoverState({ maxCooldownMs: cfg.failoverMaxCooldownMs });
         return loaded.mod;
       });
 
       const offFailure = ctx.on('agent/request-error', async (payload, next) => {
         const mod = await ready;
-        if (!mod || disposed || !state) return next();
+        if (!mod || disposed || !failoverState) return next();
 
         const failure = payload?.failure;
         const route = typeof payload?.provider === 'string' ? payload.provider : '';
@@ -1441,40 +1491,53 @@ function apply(ctx, config) {
 
         if (!route || !sessionId || !mod.shouldFailover(failure)) return next();
 
+        // 诊断这次失败：冷却多久、多严重、是不是额度问题、端点有没有给 Retry-After。
+        // 这一步是纯计算，不做网络调用 —— 热路径上不能等。
+        const diagnosis = mod.describeFailure(failure, { maxCooldownMs: cfg.failoverMaxCooldownMs });
+
+        // 端点说"1 秒后再来"：就地重试更划算，不折腾换渠道。
+        if (diagnosis.immediate) {
+          logger?.info?.(
+            `[framework-doctor] ${route} asked to retry in ${diagnosis.retryAfterMs}ms; retrying in place`,
+          );
+          return { kind: 'retry' };
+        }
+
         const target = readTarget(settings);
         if (target.error) return next();
 
-        // 记一次失败：这个 route 进入冷却，避免同一 attempt 链条反复打同一个坏渠道。
-        const cooling = state.markFailed(sessionId, route);
+        // 记一次失败：该渠道按错误类型进入冷却（连续失败会翻倍）。
+        const marked = failoverState.markFailed(sessionId, route, failure);
 
         // 当前 attempt 用的是哪个模型：优先用会话里记着的（第一次失败时记的原始选择），
         // payload 本身不带 model。
-        const previous = state.getOverride(sessionId);
-        if (previous && previous.provider) cooling.add(previous.provider);
-        const wantedModel = previous?.model ?? state.modelFor(sessionId) ?? '';
+        const previous = failoverState.getOverride(sessionId);
+        if (previous && previous.provider) marked.cooling.add(previous.provider);
+        const wantedModel = previous?.model ?? failoverState.modelFor(sessionId) ?? '';
 
         const picked = mod.pickFailoverTarget({
           failedProvider: route,
           model: wantedModel,
           providers: target.providers,
-          cooling,
+          cooling: marked.cooling,
           registered: (readLlmProviders(ctx) || []).map((row) => row.id),
         });
 
         if (!picked) {
-          state.noteExhausted();
+          failoverState.noteExhausted();
           logger?.warn?.(
             `[framework-doctor] no failover target for ${route}` +
               `${wantedModel ? ` (model ${wantedModel})` : ''} ` +
-              `after ${failure?.code || failure?.status || 'failure'}; leaving the error terminal`,
+              `after ${diagnosis.code}; leaving the error terminal` +
+              (diagnosis.billing ? ' (this looks like a quota/billing problem)' : ''),
           );
           return next();
         }
 
-        state.setOverride(sessionId, picked);
+        failoverState.setOverride(sessionId, picked);
         logger?.info?.(
           `[framework-doctor] failover ${route} → ${picked.route} (${picked.model}) ` +
-            `after ${failure?.code || failure?.status || 'failure'}; retrying`,
+            `after ${diagnosis.code} [${diagnosis.severity}, cooldown ${Math.round(marked.cooldownMs / 1000)}s]; retrying`,
         );
         return { kind: 'retry' };
       });
@@ -1482,16 +1545,16 @@ function apply(ctx, config) {
       const offRequest = ctx.on('agent/request', async (payload, next) => {
         const config = await next();
         const mod = await ready;
-        if (!mod || disposed || !state) return config;
+        if (!mod || disposed || !failoverState) return config;
 
         const sessionId = payload?.agent?.id;
         if (!sessionId) return config;
 
         // 记下这一步真实要用的模型：request-error 的 payload 不带 model，
         // 换渠道时要靠它来判断"同名模型"。
-        state.noteModel(sessionId, config.model);
+        failoverState.noteModel(sessionId, config.model);
 
-        const override = state.getOverride(sessionId);
+        const override = failoverState.getOverride(sessionId);
         if (!override || !override.provider || !override.model) return config;
 
         // 只有在确实还是"换过去的那条路由"时才替换；
@@ -1503,16 +1566,20 @@ function apply(ctx, config) {
 
       // 成功的轮次结束后清掉覆盖，回归用户原本的模型选择。
       const offTurnEnd = ctx.on('agent/turn-stopping', async (payload) => {
-        if (!state) return;
+        if (!failoverState) return;
         const sessionId = payload?.agent?.id;
         if (!sessionId) return;
-        if (state.getOverride(sessionId)) state.clearOverride(sessionId);
+        const override = failoverState.getOverride(sessionId);
+        // 这一轮是靠换渠道跑完的：说明备用渠道是好的，把它的健康档案清零，
+        // 下次还能继续用它；同时清掉覆盖，下一轮回到用户自己的选择。
+        if (override?.provider) failoverState.markHealthy(sessionId, override.provider);
+        if (override) failoverState.clearOverride(sessionId);
       });
 
       const offDisposed = ctx.on('agent/disposed', (payload) => {
-        if (!state) return;
+        if (!failoverState) return;
         const sessionId = payload?.agent?.id;
-        if (sessionId) state.forget(sessionId);
+        if (sessionId) failoverState.forget(sessionId);
       });
 
       return () => {

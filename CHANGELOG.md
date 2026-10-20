@@ -6,10 +6,18 @@
   (`RATE_LIMIT`/429, `QUOTA`, `SERVER`, `TIMEOUT`, `TRANSPORT`,
   `EMPTY_RESPONSE`), the plugin looks for the same model on another configured
   channel and retries there in the same turn, instead of leaving the session
-  stuck. A failed channel enters a cooldown so the retry cannot bounce back to
-  it, and errors a different channel cannot fix (credential, unknown model,
+  stuck. Errors a different channel cannot fix (credential, unknown model,
   HTTP 400/401) never trigger it. `failover: false` in the row config turns it
   off.
+- **Cooldowns derived from the error** — quota waits far longer than a rate
+  limit, a 5xx or network blip retries sooner, an endpoint's `Retry-After` wins
+  outright (and a very short one retries in place instead of switching).
+  Consecutive failures double the cooldown; one success clears it.
+- **Channel health records** — every failure is kept as a record (error type,
+  severity, billing flag, consecutive count, remaining cooldown), exposed at
+  `/state` and through a new `channel-health` info tool, so the chat section can
+  explain which channel is broken, how badly, whether the user needs to top up,
+  and roughly when it recovers.
 
 ## 0.1.0 — 2026-10-19
 
