@@ -14,6 +14,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 
 const SUITES = [
   ['lib', 'framework-doctor-lib.mjs'],
+  ['failover', 'framework-doctor-failover.mjs'],
   ['host', 'framework-doctor-host.mjs'],
   ['client', 'framework-doctor-client.mjs'],
 ];

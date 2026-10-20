@@ -9,3 +9,6 @@
       config:
         enabled: true
         probeTimeoutMs: 15000
+        # 模型 429 / 配额 / 服务端错误时，换一个已接入的渠道继续（同一个模型）。
+        failover: true
+        failoverCooldownMs: 60000

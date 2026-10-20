@@ -86,6 +86,44 @@ Auto-fixable findings can be applied in one click. Repairs are generated as
 two deliberate exceptions (drop a duplicate model id, and set `reasoningEfforts`
 to `false` on a model that should not have one).
 
+### Session failover
+
+When a model call fails with a retryable error — `RATE_LIMIT` (429), `QUOTA`,
+`SERVER`, `TIMEOUT`, `TRANSPORT`, `EMPTY_RESPONSE` — the plugin looks for the
+**same model on another configured channel** and retries there, so the session
+keeps going instead of stalling.
+
+It hooks two harness events:
+
+| Event | Role |
+|---|---|
+| `agent/request-error` | Decide whether to fail over. Returning `{ kind: 'retry' }` makes the agent loop retry inside the same turn and step. |
+| `agent/request` | Replace the provider/model for that retry with the chosen channel. |
+
+Selection is conservative:
+
+1. **Same model id** on another provider that has a `baseURL` and is registered
+   with the model service.
+2. Failing that, the **same model after stripping a vendor prefix** (so
+   `deepseek/deepseek-v3` on a gateway matches `deepseek-v3` elsewhere).
+3. If neither exists, the error is left terminal — it is not silently swapped for
+   a different model.
+
+A failed route enters a cooldown (default 60s) so the retry cannot bounce back to
+the channel that just failed. The override is cleared when the turn finishes, so
+the next turn returns to your own model choice. Errors that a different channel
+cannot fix — `INVALID_CREDENTIAL`, `MISSING_CREDENTIAL`, `UNKNOWN_MODEL`, HTTP
+400/401 — never trigger a failover.
+
+Disable it (or tune the cooldown) in the row config:
+
+```yaml
+- id: framework-doctor
+  config:
+    failover: true
+    failoverCooldownMs: 60000
+```
+
 ## Install
 
 ```sh
@@ -133,6 +171,7 @@ Three suites, none of which need a running harness:
 | Suite | Checks |
 |---|---|
 | `tests/framework-doctor-lib.mjs` | `lib/infer.js` capability derivation, `lib/diagnose.js` rules, `lib/repair.js` plans, plus an end-to-end probe against a local fake OpenAI-compatible endpoint |
+| `tests/framework-doctor-failover.mjs` | Retryable-error classification, channel selection, cooldown bookkeeping, and the host wiring that turns a 429 into a switch-and-retry |
 | `tests/framework-doctor-host.mjs` | Host routes, `/apply` validation and merge semantics, `/chat` tool loop, the trust fence, and degradation when a service is missing |
 | `tests/framework-doctor-client.mjs` | Loads `client.js` against a stubbed module loader and React, renders every section, and checks theme-token and boundary constraints |
 
@@ -145,6 +184,7 @@ Three suites, none of which need a running harness:
 | `lib/infer.js` | Endpoint interrogation and capability derivation |
 | `lib/diagnose.js` | The checkup rules |
 | `lib/repair.js` | Findings to `settings.mutate` operations |
+| `lib/failover.js` | Retryable-error classification and same-model channel selection |
 | `lib/trust.js` | Request trust fence for the plugin's HTTP surface |
 
 ## License

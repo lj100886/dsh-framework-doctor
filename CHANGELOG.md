@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- **Session failover** — when a model call fails with a retryable error
+  (`RATE_LIMIT`/429, `QUOTA`, `SERVER`, `TIMEOUT`, `TRANSPORT`,
+  `EMPTY_RESPONSE`), the plugin looks for the same model on another configured
+  channel and retries there in the same turn, instead of leaving the session
+  stuck. A failed channel enters a cooldown so the retry cannot bounce back to
+  it, and errors a different channel cannot fix (credential, unknown model,
+  HTTP 400/401) never trigger it. `failover: false` in the row config turns it
+  off.
+
 ## 0.1.0 — 2026-10-19
 
 First release.

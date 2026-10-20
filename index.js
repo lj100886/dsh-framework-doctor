@@ -48,6 +48,9 @@ function normalizeConfig(config) {
   return {
     enabled: raw.enabled !== false,
     probeTimeoutMs: clampInt(raw.probeTimeoutMs, 3_000, 60_000, 15_000),
+    // 会话级故障转移：默认开。关掉它，模型 429 时就是原样报错。
+    failover: raw.failover !== false,
+    failoverCooldownMs: clampInt(raw.failoverCooldownMs, 5_000, 600_000, 60_000),
   };
 }
 
@@ -1396,6 +1399,131 @@ function apply(ctx, config) {
   });
 
   /* 不设自动巡检：配置好之后不动它，体检只在用户手动点、或配置被改动时进行。 */
+
+  /* ---------------------------------------------------------------- *
+   * 会话级故障转移
+   *
+   * 模型调用因 429 / 配额 / 服务端错误中断时，换一个已接入的渠道继续，
+   * 而不是让会话卡在那里。
+   *
+   * 机制（已对着 harness 的 agent-loop 源码确认）：
+   *   - `agent/request-error` 返回 { kind: 'retry' } → loop `continue`，
+   *     在同一 turn/step 内重新走 prepareRequest；
+   *   - prepareRequest 每次都重新触发 `agent/request` waterfall，
+   *     那里返回的 provider/model 就是这次 attempt 真正要用的路由。
+   *
+   * 所以：request-error 里挑好备用渠道并写进会话覆盖表，request 里读表替换。
+   * 只在**失败之后**才换，绝不改动用户原本的选择。
+   * ---------------------------------------------------------------- */
+
+  if (cfg.failover) {
+    ctx.effect(() => {
+      let state = null;
+      let disposed = false;
+
+      // 懒加载：failover 模块坏了不能连累插件本体起来。
+      const ready = load('failover', () => import('./lib/failover.js')).then((loaded) => {
+        if (!loaded.ok) {
+          logger?.warn?.(`[framework-doctor] failover disabled: ${loaded.error}`);
+          return null;
+        }
+        state = loaded.mod.createFailoverState({ cooldownMs: cfg.failoverCooldownMs });
+        return loaded.mod;
+      });
+
+      const offFailure = ctx.on('agent/request-error', async (payload, next) => {
+        const mod = await ready;
+        if (!mod || disposed || !state) return next();
+
+        const failure = payload?.failure;
+        const route = typeof payload?.provider === 'string' ? payload.provider : '';
+        const sessionId = payload?.agent?.id;
+
+        if (!route || !sessionId || !mod.shouldFailover(failure)) return next();
+
+        const target = readTarget(settings);
+        if (target.error) return next();
+
+        // 记一次失败：这个 route 进入冷却，避免同一 attempt 链条反复打同一个坏渠道。
+        const cooling = state.markFailed(sessionId, route);
+
+        // 当前 attempt 用的是哪个模型：优先用会话里记着的（第一次失败时记的原始选择），
+        // payload 本身不带 model。
+        const previous = state.getOverride(sessionId);
+        if (previous && previous.provider) cooling.add(previous.provider);
+        const wantedModel = previous?.model ?? state.modelFor(sessionId) ?? '';
+
+        const picked = mod.pickFailoverTarget({
+          failedProvider: route,
+          model: wantedModel,
+          providers: target.providers,
+          cooling,
+          registered: (readLlmProviders(ctx) || []).map((row) => row.id),
+        });
+
+        if (!picked) {
+          state.noteExhausted();
+          logger?.warn?.(
+            `[framework-doctor] no failover target for ${route}` +
+              `${wantedModel ? ` (model ${wantedModel})` : ''} ` +
+              `after ${failure?.code || failure?.status || 'failure'}; leaving the error terminal`,
+          );
+          return next();
+        }
+
+        state.setOverride(sessionId, picked);
+        logger?.info?.(
+          `[framework-doctor] failover ${route} → ${picked.route} (${picked.model}) ` +
+            `after ${failure?.code || failure?.status || 'failure'}; retrying`,
+        );
+        return { kind: 'retry' };
+      });
+
+      const offRequest = ctx.on('agent/request', async (payload, next) => {
+        const config = await next();
+        const mod = await ready;
+        if (!mod || disposed || !state) return config;
+
+        const sessionId = payload?.agent?.id;
+        if (!sessionId) return config;
+
+        // 记下这一步真实要用的模型：request-error 的 payload 不带 model，
+        // 换渠道时要靠它来判断"同名模型"。
+        state.noteModel(sessionId, config.model);
+
+        const override = state.getOverride(sessionId);
+        if (!override || !override.provider || !override.model) return config;
+
+        // 只有在确实还是"换过去的那条路由"时才替换；
+        // 用户若在失败后手动改了模型，config 已经不同，就尊重用户。
+        if (config.provider === override.provider && config.model === override.model) return config;
+
+        return { ...config, provider: override.provider, model: override.model };
+      });
+
+      // 成功的轮次结束后清掉覆盖，回归用户原本的模型选择。
+      const offTurnEnd = ctx.on('agent/turn-stopping', async (payload) => {
+        if (!state) return;
+        const sessionId = payload?.agent?.id;
+        if (!sessionId) return;
+        if (state.getOverride(sessionId)) state.clearOverride(sessionId);
+      });
+
+      const offDisposed = ctx.on('agent/disposed', (payload) => {
+        if (!state) return;
+        const sessionId = payload?.agent?.id;
+        if (sessionId) state.forget(sessionId);
+      });
+
+      return () => {
+        disposed = true;
+        offFailure?.();
+        offRequest?.();
+        offTurnEnd?.();
+        offDisposed?.();
+      };
+    }, 'framework-doctor: session failover');
+  }
 
   logger?.info?.('[framework-doctor] ready');
 }

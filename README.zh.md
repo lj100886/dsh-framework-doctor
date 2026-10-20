@@ -73,6 +73,38 @@ provider 请求失败。表格里会标注每一行是端点声明的还是推�
 生成 `unset`**，只有两个刻意的例外（删掉重复的模型 id；给不该有档位的模型把
 `reasoningEfforts` 设为 `false`）。
 
+### 会话故障转移
+
+模型调用因为**可重试的错误**中断时——`RATE_LIMIT`（429）、`QUOTA`、`SERVER`、
+`TIMEOUT`、`TRANSPORT`、`EMPTY_RESPONSE`——插件会去**已配置的其它渠道里找同一个
+模型**接上去重试，让会话继续跑，而不是卡在那里。
+
+它挂在两个 harness 事件上：
+
+| 事件 | 作用 |
+|---|---|
+| `agent/request-error` | 决定要不要换渠道。返回 `{ kind: 'retry' }` 会让 agent loop 在**同一个 turn 和 step 内**重试。 |
+| `agent/request` | 把这次重试的 provider/model 换成挑好的渠道。 |
+
+挑选很保守：
+
+1. 别的 provider 里有**完全同名的模型**，且那个 provider 有 `baseURL`、已注册到模型服务；
+2. 退一步，**去掉 vendor 前缀后同名**（网关上的 `deepseek/deepseek-v3` 和别处的 `deepseek-v3`）；
+3. 两者都没有，就让错误照常终止——**不会偷偷换成另一个模型**。
+
+失败过的路由进入冷却（默认 60 秒），避免重试又弹回刚失败的那个渠道。这一轮结束后
+覆盖会被清掉，下一轮回到你自己选的模型。换渠道也修不了的错误——`INVALID_CREDENTIAL`、
+`MISSING_CREDENTIAL`、`UNKNOWN_MODEL`、HTTP 400/401——**不会**触发换渠道。
+
+可以关掉或调冷却时间：
+
+```yaml
+- id: framework-doctor
+  config:
+    failover: true
+    failoverCooldownMs: 60000
+```
+
 ## 安装
 
 ```sh
@@ -114,6 +146,7 @@ node tests/run-all.mjs    # 或：npm test
 | 套件 | 检查什么 |
 |---|---|
 | `tests/framework-doctor-lib.mjs` | `lib/infer.js` 的能力推导、`lib/diagnose.js` 的规则、`lib/repair.js` 的计划，以及对着本地假 OpenAI 兼容端点的端到端探测 |
+| `tests/framework-doctor-failover.mjs` | 可重试错误的分类、渠道挑选、冷却记账，以及"429 → 换渠道 → retry"的 Host 接线 |
 | `tests/framework-doctor-host.mjs` | Host 路由、`/apply` 的校验与合并语义、`/chat` 的工具循环、信任围栏、缺服务时的降级 |
 | `tests/framework-doctor-client.mjs` | 在桩出来的模块加载器和 React 下加载 `client.js`，渲染每个区，并检查主题 token 与边界约束 |
 
@@ -126,6 +159,7 @@ node tests/run-all.mjs    # 或：npm test
 | `lib/infer.js` | 端点探测与能力推导 |
 | `lib/diagnose.js` | 体检规则 |
 | `lib/repair.js` | 把问题转成 `settings.mutate` 操作 |
+| `lib/failover.js` | 可重试错误的分类与同模型渠道挑选 |
 | `lib/trust.js` | 插件 HTTP 面的请求信任围栏 |
 
 ## 许可
