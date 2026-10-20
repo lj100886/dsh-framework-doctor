@@ -53,6 +53,9 @@ function normalizeConfig(config) {
     // 冷却时长由错误类型决定（QUOTA 30 分钟 / 429 3 分钟 / 5xx 1 分钟 / 网络抖动更短），
     // 这里只给一个上限，避免某个渠道被永久晾着。
     failoverMaxCooldownMs: clampInt(raw.failoverMaxCooldownMs, 60_000, 6 * 3_600_000, 3_600_000),
+    // 框架医生自己用哪个模型：有序候选链 + 是否回退到默认模型。
+    // 不配就是"用默认模型"，行为与之前一致。
+    model: isObject(raw.model) ? raw.model : {},
   };
 }
 
@@ -358,6 +361,7 @@ function apply(ctx, config) {
   const loadDiagnose = () => load('diagnose', () => import('./lib/diagnose.js'));
   const loadRepair = () => load('repair', () => import('./lib/repair.js'));
   const loadFailover = () => load('failover', () => import('./lib/failover.js'));
+  const loadAssistantModel = () => load('assistant-model', () => import('./lib/assistant-model.js'));
 
   /** 最近一次扫描结果，供 /state 与页面首屏使用。 */
   let lastScan = null;
@@ -681,13 +685,29 @@ function apply(ctx, config) {
    *   - 动作建议：回复末尾的 `ACTIONS:` 段变成可点击按钮，写操作由用户按下才执行。
    */
   async function chat(body) {
-    const selection = readDefaultSelection(ctx);
-    if (!selection || !selection.provider || !selection.model) {
-      return { ok: false, error: '没有可用的默认模型，无法对话（请先在模型设置里选一个默认模型）' };
-    }
     const llm = ctx.get('llm');
     if (!llm || typeof llm.stream !== 'function') {
       return { ok: false, error: '模型服务不可用（ctx.llm 未提供），无法对话' };
+    }
+
+    // 框架医生自己的模型链：优先用它自己配置的，没配就退回默认模型。
+    // 这样用户可以让对话用贵的、诊断用便宜的，反过来也行。
+    const selection = readDefaultSelection(ctx);
+    const loadedModel = await loadAssistantModel();
+    if (!loadedModel.ok) {
+      return { ok: false, error: `模型路由模块加载失败：${loadedModel.error}` };
+    }
+    const modelMod = loadedModel.mod;
+    const chain = modelMod.resolveModelChain(cfg.model, { defaultSelection: selection });
+
+    const chainEntries = chain.entries ?? [];
+    if (chainEntries.length === 0) {
+      return {
+        ok: false,
+        error:
+          '没有可用的模型：既没有配置框架医生的模型链（config.model.chain），' +
+          '也没有设置默认模型。请先在模型设置里选一个默认模型。',
+      };
     }
 
     const scanResult = await scan();
@@ -736,7 +756,8 @@ function apply(ctx, config) {
       '  · **现在还能不能用**：明确告诉用户当前有没有可用渠道、框架医生已经自动切到哪了、他自己的模型选择还保不保得住；',
       '- 不要建议用户去改 `failover` 的冷却参数——那是插件按错误类型自动决定的，不是用户该调的东西。',
       '',
-      `当前默认模型：${selection.provider} / ${selection.model}`,
+      `当前框架医生用的模型：${chainEntries.map((e) => `${e.provider}/${e.model}`).join(' → ')}` +
+        `${chain.explicit ? '（用户配置的链）' : '（默认模型）'}`,
       '',
       `开场摘要（需要细节就用工具查）：健康分 ${scanResult.health}/100；致命 ${scanResult.summary.fatal}、警告 ${scanResult.summary.warn}、提示 ${scanResult.summary.info}`,
     );
@@ -775,34 +796,78 @@ function apply(ctx, config) {
 
     // 工具循环：模型可以连续索取信息（最多 4 轮），拿够了再给最终回答。
     const consulted = [];
+    const rounds = [];
     const MAX_TOOL_ROUNDS = 4;
     let rawReply = '';
     let lastText = '';
+    // 这一轮对话实际用着哪个模型：可能因为连续失败而沿着链往后挪。
+    let active = chainEntries[0];
 
     for (let round = 0; round <= MAX_TOOL_ROUNDS; round += 1) {
-      const controller = new AbortController();
-      const stream = llm.stream({
-        provider: selection.provider,
-        model: selection.model,
-        messages,
-        signal: controller.signal,
-      });
+      // 一次模型调用：失败就沿着链换下一个候选，全部失败才放弃。
+      // 框架医生的调用是"用户点了一下就等结果"，能多试一个就多试一个。
+      let roundText = null;
+      let lastFailure = null;
+      let startIndex = chainEntries.indexOf(active);
+      if (startIndex < 0) startIndex = 0;
 
-      const chunks = [];
-      let finished = false;
-      try {
-        for await (const chunk of stream) {
-          if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') chunks.push(chunk.text);
-          if (chunk?.type === 'finish') finished = true;
+      for (const candidate of chainEntries.slice(startIndex)) {
+        const controller = new AbortController();
+        const chunks = [];
+        let finished = false;
+        let failure = null;
+        try {
+          const stream = llm.stream({
+            provider: candidate.provider,
+            model: candidate.model,
+            messages,
+            signal: controller.signal,
+          });
+          for await (const chunk of stream) {
+            if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') chunks.push(chunk.text);
+            if (chunk?.type === 'finish') {
+              finished = true;
+              // finish 里带着失败原因时也算这一跳失败（流可能正常结束但结果是 error）。
+              const reason = chunk.reason;
+              if (reason && (reason.kind === 'error' || reason.kind === 'aborted')) {
+                failure = reason.failure ?? { code: reason.kind };
+              }
+            }
+          }
+        } catch (error) {
+          failure = { code: error?.code, status: error?.status, message: messageOf(error) };
         }
-      } catch (error) {
-        return { ok: false, error: `对话失败：${messageOf(error)}` };
-      }
-      if (!finished && chunks.length === 0) {
-        return { ok: false, error: '模型没有返回任何内容（可能被中止或无输出）' };
+
+        if (!failure && (finished || chunks.length > 0)) {
+          rounds.push({ provider: candidate.provider, model: candidate.model, source: candidate.source });
+          active = candidate;
+          roundText = chunks.join('');
+          break;
+        }
+
+        // 这一跳失败：记进渠道健康档案，报告口径和会话故障转移保持一致。
+        lastFailure = failure ?? { code: 'EMPTY_RESPONSE', message: '模型没有返回任何内容' };
+        if (failoverState) {
+          failoverState.markFailed(`framework-doctor:${candidate.provider}`, candidate.provider, lastFailure);
+        }
+        logger?.warn?.(
+          `[framework-doctor] assistant model ${candidate.provider}/${candidate.model} failed ` +
+            `(${lastFailure.code}); trying next candidate`,
+        );
       }
 
-      const roundText = chunks.join('');
+      if (roundText === null) {
+        const detail = lastFailure?.message || lastFailure?.code || '未知原因';
+        return {
+          ok: false,
+          error:
+            `所有候选模型都失败了（共 ${chainEntries.length} 个）：${detail}。` +
+            '请在「框架医生」的模型设置里换一条可用的链，或检查渠道凭据。',
+          triedChain: chainEntries.map((e) => `${e.provider}/${e.model}`),
+          rounds,
+        };
+      }
+
       lastText = roundText;
       const { calls, text } = parseToolCalls(roundText);
 
@@ -843,7 +908,9 @@ function apply(ctx, config) {
       reply,
       actions,
       consulted,
-      model: { provider: selection.provider, model: selection.model },
+      model: { provider: active.provider, model: active.model },
+      // 这次对话实际用过哪些候选（正常情况下只有一个；有降级时能看到切换轨迹）。
+      rounds,
       generatedAt: new Date().toISOString(),
     };
   }
@@ -1331,6 +1398,30 @@ function apply(ctx, config) {
         health: lastScan?.health ?? null,
         summary: lastScan?.summary ?? null,
         channelHealth: failoverState ? failoverState.report() : [],
+        // 框架医生自己用哪个模型、这条链现在还有没有能跑的。
+        assistantModel: (() => {
+          const selection = readDefaultSelection(ctx);
+          const mod = null; // 同步路径不加载模块，这里只做纯展示用的简化推导。
+          const cfgChain = Array.isArray(cfg.model?.chain) ? cfg.model.chain : [];
+          const entries = [];
+          for (const row of cfgChain) {
+            if (!isObject(row)) continue;
+            const provider = typeof row.provider === 'string' ? row.provider.trim() : '';
+            const model = typeof row.model === 'string' ? row.model.trim() : '';
+            if (provider && model) entries.push({ provider, model, source: 'chain' });
+          }
+          const fallback = cfg.model?.fallbackToDefaultModel !== false;
+          if (fallback && selection?.provider && selection?.model &&
+              !entries.some((e) => e.provider === selection.provider && e.model === selection.model)) {
+            entries.push({ provider: selection.provider, model: selection.model, source: 'default' });
+          }
+          void mod;
+          return {
+            chain: entries,
+            explicit: cfgChain.length > 0,
+            fallbackToDefaultModel: fallback,
+          };
+        })(),
         config: {
           failover: cfg.failover,
           failoverMaxCooldownMs: cfg.failoverMaxCooldownMs,

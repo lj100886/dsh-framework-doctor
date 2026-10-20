@@ -74,6 +74,16 @@ window.__ModuleLoader__.load({
 .__fd_root .__fd_chipInfo{border-color:var(--fd-idle);color:var(--dsw-alias-label-secondary)}
 .__fd_root .__fd_chipOk{border-color:var(--fd-ok);color:var(--fd-ok)}
 .__fd_root .__fd_health{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.__fd_root .__fd_assist{border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-2);padding:10px 12px;margin-bottom:10px;display:flex;flex-direction:column;gap:8px}
+.__fd_root .__fd_assistHead{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.__fd_root .__fd_assistTitle{font-weight:600;font-size:12px}
+.__fd_root .__fd_chain{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.__fd_root .__fd_chainItem{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border:1px solid var(--dsw-alias-border-l2);border-radius:999px;font-size:11px;background:var(--dsw-alias-bg-layer-3)}
+.__fd_root .__fd_chainItemFirst{border-color:var(--dsw-alias-brand-primary)}
+.__fd_root .__fd_chainItemBad{opacity:.55;border-style:dashed}
+.__fd_root .__fd_chainIdx{font-weight:600;color:var(--dsw-alias-label-tertiary)}
+.__fd_root .__fd_billing{border-top:1px dashed var(--dsw-alias-border-l1);padding-top:8px;display:flex;flex-direction:column;gap:6px}
+.__fd_root .__fd_billingText{font-size:12px;color:var(--dsw-alias-state-warn-primary);margin:0}
 .__fd_root .__fd_report{border:1px solid var(--dsw-alias-border-l2);border-radius:8px;overflow:hidden;margin-bottom:10px}
 .__fd_root .__fd_chat{display:flex;flex-direction:column;gap:10px}
 .__fd_root .__fd_chatList{display:flex;flex-direction:column;gap:10px;max-height:460px;overflow-y:auto;padding:4px 2px}
@@ -216,6 +226,15 @@ window.__ModuleLoader__.load({
       info: '提示',
       health: '健康分',
       healthRule: '健康分 = 100 − 致命×18 − 警告×6 − 提示×1（最低 0）',
+      assistantModel: '框架医生用的模型',
+      assistantModelConfig: '按你配置的链降级，上一跳失败自动换下一跳',
+      assistantModelDefault: '当前跟随默认模型（未单独配置）',
+      assistantModelEmpty: '还没有可用模型，请先选一个默认模型',
+      chainCooling: '这个渠道刚失败过，暂时跳过',
+      chainFallback: '兜底的默认模型',
+      billingHint: '检测到 {n} 个渠道出现额度/限流问题——这类问题重试没用，需要你去充值或换套餐。',
+      openBilling: '去处理额度',
+      billingWhere: '余额、积分、账号都在「设置 → Our Free Model」这类渠道插件页里；框架医生读不到别家的账单，只能把你送过去。',
       allGood: '没有发现问题，框架是健康的。',
       diagFail: '体检失败',
       autoFixable: '可自动修复',
@@ -333,6 +352,15 @@ window.__ModuleLoader__.load({
       info: 'info',
       health: 'Health',
       healthRule: 'Health = 100 − fatal×18 − warn×6 − info×1 (floor 0)',
+      assistantModel: "The doctor's model",
+      assistantModelConfig: 'Falls back along your configured chain when a hop fails',
+      assistantModelDefault: 'Following the default model (not configured separately)',
+      assistantModelEmpty: 'No usable model yet — pick a default model first',
+      chainCooling: 'This channel just failed and is being skipped',
+      chainFallback: 'Default model, used as the last resort',
+      billingHint: '{n} channel(s) hit quota or rate limits — retrying will not help; this needs a top-up or a plan change.',
+      openBilling: 'Handle quota',
+      billingWhere: 'Balance, credits and accounts live in channel plugins such as Settings → Our Free Model; the doctor cannot read their billing, so it only takes you there.',
       allGood: 'No findings — the framework is healthy.',
       diagFail: 'Check failed',
       autoFixable: 'auto-fixable',
@@ -1048,6 +1076,13 @@ window.__ModuleLoader__.load({
         h('span', { style: { flex: 1 } }),
         h('span', { className: '__fd_hint' }, t('healthRule'))),
 
+      /* 框架医生自己用哪个模型 + 渠道健康（含额度问题跳转）。 */
+      h(AssistantModelPanel, {
+        t: t,
+        data: props.data,
+        onOpenBilling: props.onOpenBilling,
+      }),
+
       diag.status === 'idle' ? h('p', { className: '__fd_hint' }, t('loading')) : null,
       diag.error ? h('p', { className: '__fd_error' }, t('diagFail') + '：' + diag.error) : null,
       diag.status === 'ready' && (diag.findings || []).length === 0
@@ -1062,6 +1097,64 @@ window.__ModuleLoader__.load({
             return findingRow(t, finding, props.repair, props.onRepairOne);
           }));
       }));
+    }
+
+    /* ------------------------------------------------------------------ *
+     * 框架医生的模型 + 渠道健康面板
+     *
+     * 两件事：
+     *   1. 告诉用户"框架医生现在用哪个模型"，以及这条链的降级顺序；
+     *   2. 渠道出问题时给出可操作提示——额度类问题直接给跳转，
+     *      因为我们读不到别家插件的余额，只能把用户送到他自己的账单页。
+     * ------------------------------------------------------------------ */
+    function AssistantModelPanel(props) {
+      var t = props.t;
+      var data = props.data || {};
+      var info = data.assistantModel || { chain: [], explicit: false, fallbackToDefaultModel: true };
+      var rows = Array.isArray(data.channelHealth) ? data.channelHealth : [];
+      var chain = Array.isArray(info.chain) ? info.chain : [];
+
+      // 只看这一轮（框架医生自己）的失败记录，别的会话的不混进来。
+      var mine = rows.filter(function (row) { return String(row.sessionId || '').indexOf('framework-doctor:') === 0; });
+      var coolingNow = mine.filter(function (row) { return row.cooling; });
+      var billing = mine.filter(function (row) { return row.billing; });
+
+      if (chain.length === 0 && mine.length === 0) return null;
+
+      return h('div', { className: '__fd_assist' },
+        h('div', { className: '__fd_assistHead' },
+          h('span', { className: '__fd_assistTitle' }, t('assistantModel')),
+          h('span', { className: '__fd_hint' },
+            info.explicit ? t('assistantModelConfig') : t('assistantModelDefault'))),
+        chain.length
+          ? h('div', { className: '__fd_chain' },
+              chain.map(function (entry, index) {
+                var isCooling = coolingNow.some(function (row) { return row.route === entry.provider; });
+                return h('span', {
+                  key: entry.provider + '/' + entry.model,
+                  className: '__fd_chainItem' + (isCooling ? ' __fd_chainItemBad' : index === 0 ? ' __fd_chainItemFirst' : ''),
+                  title: isCooling ? t('chainCooling') : (entry.source === 'default' ? t('chainFallback') : ''),
+                },
+                h('span', { className: '__fd_chainIdx' }, String(index + 1)),
+                h('span', { className: '__fd_mid' }, entry.provider + ' / ' + entry.model));
+              }))
+          : h('p', { className: '__fd_hint' }, t('assistantModelEmpty')),
+
+        billing.length
+          ? h('div', { className: '__fd_billing' },
+              h('p', { className: '__fd_billingText' },
+                t('billingHint').replace('{n}', String(billing.length))),
+              h('div', { className: '__fd_actions' },
+                h('button', {
+                  type: 'button',
+                  className: '__fd_primary',
+                  onClick: function () {
+                    // 跳到提供这些免费车道的插件页：余额/积分/账号都在那里。
+                    if (props.onOpenBilling) props.onOpenBilling();
+                  },
+                }, t('openBilling')),
+                h('span', { className: '__fd_hint' }, t('billingWhere'))))
+          : null);
     }
 
     /* ------------------------------------------------------------------ *
@@ -1291,6 +1384,30 @@ window.__ModuleLoader__.load({
         });
       }
 
+      /**
+       * 跳到「充值/额度」该去的地方。
+       *
+       * 框架医生读不到别家插件的余额（它们的接口走浏览器凭据，Host 拿不到），
+       * 所以这里只做跳转：把用户送到真正管这些的那一页。
+       * 默认跳 Our Free Model——免费车道和十三个白嫖渠道的积分都在那儿。
+       */
+      function openBilling() {
+        var layout = props.ctx && props.ctx.get ? props.ctx.get('layout') : null;
+        if (layout && typeof layout.selectPanel === 'function') {
+          try {
+            layout.selectPanel('settings');
+          } catch (error) {
+            void error;
+          }
+        }
+        // 通知用户去哪儿：设置里那个页面管这件事。
+        if (typeof window !== 'undefined' && window.console) {
+          window.console.info(
+            '[framework-doctor] 余额/积分/账号在「设置 → Our Free Model」里（或你装的其他模型渠道插件）',
+          );
+        }
+      }
+
       function runChat(text) {
         var userMessage = { role: 'user', text: text };
         setChat(function (previous) {
@@ -1443,9 +1560,10 @@ window.__ModuleLoader__.load({
 
         h(Boundary, { t: t, title: t('sectionDiagnose') },
           h(DiagnoseSection, {
-            t: t, diag: diag, counts: counts, score: score,
+            t: t, diag: diag, counts: counts, score: score, data: data,
             onRun: runDiagnose,
             onRepairOne: function (id) { runRepair([id]); },
+            onOpenBilling: openBilling,
           })),
 
         h(Boundary, { t: t, title: t('sectionChat') },

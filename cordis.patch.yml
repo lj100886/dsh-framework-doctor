@@ -11,4 +11,15 @@
         probeTimeoutMs: 15000
         # 模型 429 / 配额 / 服务端错误时，换一个已接入的渠道继续（同一个模型）。
         failover: true
-        failoverCooldownMs: 60000
+        failoverMaxCooldownMs: 3600000
+        # 框架医生自己用哪个模型：按顺序降级，失败的跳下一个。
+        # 不写这一段 = 跟随默认模型（和以前一样）。
+        # 想让它和对话分开（例如诊断用便宜的），就把 chain 填上：
+        #
+        # model:
+        #   chain:
+        #     - provider: main-chan
+        #       model: deepseek-v4.1-flash
+        #     - provider: backup-chan
+        #       model: deepseek-v4.1-flash
+        #   fallbackToDefaultModel: true

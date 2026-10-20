@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **A model of its own, with a fallback chain** — the chat section no longer has
+  to share your default model. `config.model.chain` is an ordered list the
+  doctor walks through, hopping to the next entry whenever one fails, so a 429
+  on the first channel does not leave you with a doctor that cannot diagnose.
+  `fallbackToDefaultModel` (on by default) appends the session default as the
+  last resort. Omitting `model.chain` keeps the old follow-the-default
+  behaviour. The page lists the resolved chain and dims hops in cooldown.
+- **Billing is surfaced, not guessed** — failures that look like quota or rate
+  limiting are labelled as such and the page offers a jump to the channel
+  plugin that owns the account. It does not display someone else's balance:
+  channel plugins keep that behind their own UI (their HTTP API returns 401 to
+  a Host request, and they publish no `ctx.provide()` service), and their stats
+  carry usage only. A wrong number there would be worse than none.
+
 - **Session failover** — when a model call fails with a retryable error
   (`RATE_LIMIT`/429, `QUOTA`, `SERVER`, `TIMEOUT`, `TRANSPORT`,
   `EMPTY_RESPONSE`), the plugin looks for the same model on another configured

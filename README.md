@@ -134,6 +134,36 @@ Disable it (or cap the cooldown) in the row config:
     failoverMaxCooldownMs: 3600000
 ```
 
+### Which model the doctor uses
+
+The chat section does not have to share your default model. Configure a fallback
+chain and the doctor follows it in order, hopping to the next entry whenever one
+fails — so a 429 on the first channel does not leave you with a doctor that
+cannot diagnose:
+
+```yaml
+- id: framework-doctor
+  config:
+    model:
+      chain:
+        - provider: cheap-chan
+          model: deepseek-v4.1-flash
+        - provider: reliable-chan
+          model: deepseek-v4.1-flash
+      fallbackToDefaultModel: true   # append the session default as the last resort
+```
+
+Without `model.chain` it simply follows the default model, which is the old
+behaviour. The page shows the resolved chain in order, dimming any hop that is
+currently in cooldown.
+
+### Billing problems
+
+When a failure looks like quota or rate limiting rather than a broken endpoint,
+the page says so and offers to take you to the page that actually owns your
+balance. It cannot show the balance itself — see
+[Why it cannot read other plugins' billing](#why-it-cannot-read-other-plugins-billing).
+
 ## Install
 
 ```sh
@@ -158,6 +188,22 @@ doctor**.
 - **No plaintext secrets.** Keys go to the credential service; `headers` values
   are checked for plaintext keys and reported.
 - **No guessing.** Unverifiable model capabilities are left unset.
+
+## Why it cannot read other plugins' billing
+
+Channel plugins such as `dsh-our-free-model` keep balance, credits and accounts
+inside their own UI. Checked directly:
+
+- their stats payload carries usage only (token counts, call counts, failures,
+  latency) — no balance or credit field;
+- their HTTP API sits behind the browser credential fence. A Host-side request
+  to `/api/our-free-model/summary` returns **401**, and they publish no
+  `ctx.provide()` service for other plugins to call.
+
+So the doctor reports the *shape* of the problem ("this looks like quota, retry
+will not help, here is the channel") and hands you a link to the page that owns
+the account. Showing someone else's balance would mean guessing, and a wrong
+number there is worse than no number.
 
 ## Requirements
 
