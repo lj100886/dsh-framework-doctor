@@ -272,6 +272,8 @@ window.__ModuleLoader__.load({
       cacheRegional: '当前地区不可用（{n} 个模型）',
       cacheOther: '其它不可用（{n} 个模型）',
       cacheEgress: '出口 {ip}',
+      sessionFailuresTitle: '最近出过事的会话',
+      sessionFailuresHint: '直接读自会话日志：错误码分布 + 最后一次的原始报错',
       allGood: '没有发现问题，框架是健康的。',
       diagFail: '体检失败',
       autoFixable: '可自动修复',
@@ -418,6 +420,8 @@ window.__ModuleLoader__.load({
       cacheRegional: 'Not available in this region ({n} models)',
       cacheOther: 'Otherwise unavailable ({n} models)',
       cacheEgress: 'egress {ip}',
+      sessionFailuresTitle: 'Sessions that failed recently',
+      sessionFailuresHint: 'Read straight from the session logs: error-code mix plus the last raw error',
       allGood: 'No findings — the framework is healthy.',
       diagFail: 'Check failed',
       autoFixable: 'auto-fixable',
@@ -1146,6 +1150,9 @@ window.__ModuleLoader__.load({
       /* 渠道插件磁盘缓存里的真实失效原因（区域封锁 / 滥用流量）。 */
       h(ChannelCachePanel, { t: t, channelCache: props.channelCache }),
 
+      /* 最近真的失败过的会话：一打开就知道哪个对话出过事。 */
+      h(SessionFailuresPanel, { t: t, failures: props.sessionFailures }),
+
       diag.status === 'idle' ? h('p', { className: '__fd_hint' }, t('loading')) : null,
       diag.error ? h('p', { className: '__fd_error' }, t('diagFail') + '：' + diag.error) : null,
       diag.status === 'ready' && (diag.findings || []).length === 0
@@ -1160,6 +1167,40 @@ window.__ModuleLoader__.load({
             return findingRow(t, finding, props.repair, props.onRepairOne);
           }));
       }));
+    }
+
+    /**
+     * 最近失败过的会话。
+     *
+     * 这是用户最常问的问题："我那个对话为什么失败"。数据直接来自会话日志，
+     * 不需要他去翻文件、也不需要他描述错误。
+     */
+    function SessionFailuresPanel(props) {
+      var t = props.t;
+      var rows = Array.isArray(props.failures) ? props.failures : [];
+      if (rows.length === 0) return null;
+
+      return h('div', { className: '__fd_cache' },
+        h('div', { className: '__fd_assistHead' },
+          h('span', { className: '__fd_assistTitle' }, t('sessionFailuresTitle')),
+          h('span', { className: '__fd_hint' }, t('sessionFailuresHint'))),
+        rows.map(function (row, index) {
+          var last = row.lastFailure || {};
+          return h('div', { key: 'sf-' + index, className: '__fd_cacheRow' },
+            h('span', { className: '__fd_dot __fd_dotWarn' }),
+            h('div', { className: '__fd_findingBody' },
+              h('div', { className: '__fd_findingTitle' },
+                String(row.id || '').slice(0, 22) + ' · ' + String(row.failures || 0) + ' 次失败',
+                row.lastModel ? h('span', { className: '__fd_tag' }, String(row.lastModel)) : null),
+              // 错误码分布：一眼看出是额度问题还是请求问题
+              h('div', { className: '__fd_hint __fd_mid' },
+                (row.byCode || []).map(function (entry) {
+                  return entry.code + '×' + entry.count;
+                }).join('  ')),
+              last.message
+                ? h('div', { className: '__fd_url' }, String(last.message).slice(0, 180))
+                : null));
+        }));
     }
 
     /**
@@ -1942,6 +1983,7 @@ window.__ModuleLoader__.load({
           h(DiagnoseSection, {
             t: t, diag: diag, counts: counts, score: score, data: data,
             channelCache: Array.isArray(data.channelCache) ? data.channelCache : [],
+            sessionFailures: Array.isArray(data.recentSessionFailures) ? data.recentSessionFailures : [],
             billing: billing,
             onRun: runDiagnose,
             onRepairOne: function (id) { runRepair([id]); },

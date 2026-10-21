@@ -23,7 +23,8 @@
 
 import os from 'node:os';
 import path from 'node:path';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
+import { zstdDecompressSync as zlibZstdDecompressSync } from 'node:zlib';
 
 import { rejectionFor, connectionAdmissionView } from './lib/trust.js';
 
@@ -410,7 +411,132 @@ function apply(ctx, config) {
   const loadAssistantModel = () => load('assistant-model', () => import('./lib/assistant-model.js'));
   const loadDoctorAgent = () => load('doctor-agent', () => import('./lib/doctor-agent.js'));
   const loadComboAudit = () => load('combo-audit', () => import('./lib/combo-audit.js'));
+  const loadSessionLog = () => load('session-log', () => import('./lib/session-log.js'));
   const loadLocalChannelState = () => load('local-channel-state', () => import('./lib/local-channel-state.js'));
+
+  /**
+   * 同步读"最近失败过的会话"，给 /state 用。
+   *
+   * 逻辑和 lib/session-log.js 一致，但那个模块是异步 import 的（供对话工具用），
+   * 而 /state 是同步处理器。这里只取最近几个会话、只留摘要，避免拖慢页面。
+   *
+   * 任何失败都返回空数组：读不到会话日志不该影响体检。
+   */
+  function readRecentSessionFailuresSync() {
+    try {
+      const home = resolveDshHome();
+      if (!home) return [];
+      const root = path.join(home, 'sessions');
+      if (!existsSync(root)) return [];
+
+      // 收集会话文件，按修改时间倒序
+      const files = [];
+      const walk = (dir) => {
+        let entries;
+        try {
+          entries = readdirSync(dir, { withFileTypes: true });
+        } catch {
+          return;
+        }
+        for (const entry of entries) {
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) {
+            walk(full);
+          } else if (entry.name === 'session.v4.jsonl.zstd') {
+            try {
+              files.push({ file: full, id: path.basename(path.dirname(full)), mtime: statSync(full).mtimeMs });
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+      };
+      walk(root);
+      files.sort((a, b) => b.mtime - a.mtime);
+
+      const out = [];
+      // 只看最近 6 个：再往前翻意义不大，而且解压要时间
+      for (const session of files.slice(0, 6)) {
+        if (out.length >= 3) break;
+        const summary = readSessionFailureSummarySync(session.file);
+        if (!summary) continue;
+        out.push({ ...session, ...summary });
+      }
+      return out;
+    } catch {
+      return [];
+    }
+  }
+
+  /** 读一个会话文件，只返回失败摘要（同步）。 */
+  function readSessionFailureSummarySync(file) {
+    try {
+      const raw = readFileSync(file);
+      // 多帧 zstd：按 magic 切帧，逐帧解，再拼接切行（帧边界 ≠ 行边界）
+      const magic = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
+      const starts = [];
+      let from = 0;
+      while (from < raw.length) {
+        const at = raw.indexOf(magic, from);
+        if (at < 0) break;
+        starts.push(at);
+        from = at + 4;
+      }
+      if (starts.length === 0) return null;
+
+      const chunks = [];
+      for (let i = 0; i < starts.length; i += 1) {
+        const end = i + 1 < starts.length ? starts[i + 1] : raw.length;
+        try {
+          chunks.push(zlibZstdDecompressSync(raw.subarray(starts[i], end)).toString('utf8'));
+        } catch {
+          /* 尾帧可能不完整 */
+        }
+      }
+      const lines = chunks.join('').split('\n');
+
+      const byCode = new Map();
+      let last = null;
+      let lastModel = null;
+      const models = new Set();
+
+      for (const line of lines) {
+        const text = line.trim();
+        if (text.length === 0) continue;
+        let event;
+        try {
+          event = JSON.parse(text);
+        } catch {
+          continue;
+        }
+        if (event.type === 'model/selection' && event.data?.provider) {
+          lastModel = `${event.data.provider}/${event.data.model ?? ''}`;
+          models.add(lastModel);
+          continue;
+        }
+        if (event.type !== 'assistant/attempt') continue;
+        for (const item of event.data?.stream ?? []) {
+          const reason = item?.chunk?.reason;
+          if (!reason || reason.kind !== 'error') continue;
+          const code = String(reason.failure?.code ?? 'UNKNOWN');
+          byCode.set(code, (byCode.get(code) ?? 0) + 1);
+          last = { code, message: String(reason.failure?.message ?? '').slice(0, 200), at: event.time };
+        }
+      }
+
+      if (byCode.size === 0) return null;
+      const total = [...byCode.values()].reduce((sum, n) => sum + n, 0);
+      return {
+        failures: total,
+        byCode: [...byCode.entries()].map(([code, count]) => ({ code, count })).sort((a, b) => b.count - a.count),
+        lastFailure: last,
+        lastModel,
+        modelCount: models.size,
+      };
+    } catch {
+      return null;
+    }
+  }
 
   /**
    * 同步读渠道插件的本地可用性缓存。
@@ -639,6 +765,7 @@ function apply(ctx, config) {
     ['channel-health', '{}', '各渠道最近的失败档案：错误类型、连续失败次数、严重度、是否额度问题、冷却到什么时候。写"哪个渠道坏了 / 要不要充值 / 什么时候恢复"这类报告时用它'],
     ['channel-cache', '{}', '读渠道插件落在本地磁盘上的状态缓存：每个模型为什么不可用（区域封锁 / 被判定滥用流量 / 其它），附端点原话和出口 IP。比看错误码精确'],
     ['combo-audit', '{}', '检查 Our Free Model 的 combo 降级链：每一跳打的是哪个上游、当前可用性、有几跳是重复的同一上游、有没有真备胎。用户抱怨"用了 combo 还是不行"时先看这个'],
+    ['session-log', '{"keyword":"可选，会话标题/目录名/内容里出现过的词","limit":3}', '读会话日志，回答"那个会话为什么失败"。不给 keyword 就看最近失败的会话；给了就按关键词找。返回：用过哪些模型、失败几次、错误码分布（带"能不能靠换渠道解决"的注解）、最后一次的具体报错原文、以及一句判断。用户说"某个对话调模型失败了/框架医生没介入"时用这个'],
   ];
 
   /** 执行一次信息工具，返回给模型看的纯文本。任何失败都变成可读文本，不抛。 */
@@ -782,6 +909,46 @@ function apply(ctx, config) {
         if (!home) return '解析不出 DSH home，无法定位 combo 配置。';
         const result = loaded.mod.analyzeAllCombos(home);
         return loaded.mod.describeCombos(result);
+      }
+
+      if (tool === 'session-log') {
+        const loaded = await loadSessionLog();
+        if (!loaded.ok) return `会话日志模块加载失败：${loaded.error}`;
+        const home = resolveDshHome();
+        if (!home) return '解析不出 DSH home，无法定位会话日志。';
+        const mod = loaded.mod;
+
+        const keyword = typeof args?.keyword === 'string' ? args.keyword.trim() : '';
+        const limit = clampInt(args?.limit, 1, 8, 3);
+
+        // 有 keyword：按名字/内容找那个会话
+        if (keyword.length > 0) {
+          const hits = mod.findSessions(home, keyword, { limit });
+          if (hits.length === 0) {
+            return `没有找到匹配「${keyword}」的会话。可以换个词（标题、项目目录名、或对话里出现过的字符串）。`;
+          }
+          const parts = [`按「${keyword}」找到 ${hits.length} 个会话：`];
+          for (const hit of hits) {
+            const result = mod.diagnoseSession(hit.file);
+            parts.push('');
+            parts.push(`【${hit.id}】匹配方式：${hit.matchedBy === 'name' ? '名字' : '内容'}`);
+            parts.push(mod.describeSession(result, { project: hit.project, mtime: hit.mtime }));
+          }
+          return parts.join('\n');
+        }
+
+        // 没 keyword：看最近真的失败过的会话
+        const recent = mod.recentFailures(home, { limit });
+        if (recent.length === 0) {
+          return '最近 7 天没有会话记录到模型调用失败。';
+        }
+        const parts = [`最近 ${recent.length} 个有失败记录的会话：`];
+        for (const { session, result } of recent) {
+          parts.push('');
+          parts.push(`【${session.id}】${session.project}`);
+          parts.push(mod.describeSession(result, { project: session.project, mtime: session.mtime }));
+        }
+        return parts.join('\n');
       }
 
       return `未知的信息工具 "${tool}"。可用的：${INFO_TOOLS.map((t) => t[0]).join('、')}`;
@@ -1663,6 +1830,8 @@ function apply(ctx, config) {
         // 渠道插件落在磁盘上的可用性缓存（Host 直接读，无需鉴权）。
         // 文件只有几 KB，且页面只在打开时取一次，所以这里同步读、失败就空。
         channelCache: readChannelCacheSync(),
+        // 最近真的失败过的会话：让页面一打开就能看到"哪个对话出过事"。
+        recentSessionFailures: readRecentSessionFailuresSync(),
         // 框架医生自己用哪个模型、这条链现在还有没有能跑的。
         assistantModel: (() => {
           const selection = readDefaultSelection(ctx);

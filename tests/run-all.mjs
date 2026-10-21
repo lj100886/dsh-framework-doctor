@@ -20,6 +20,7 @@ const SUITES = [
   ['model-chain', 'framework-doctor-model-chain.mjs'],
   ['assistant-model', 'framework-doctor-assistant-model.mjs'],
   ['channel-state', 'framework-doctor-channel-state.mjs'],
+  ['session-log', 'framework-doctor-session-log.mjs'],
   ['agent', 'framework-doctor-agent.mjs'],
   ['host', 'framework-doctor-host.mjs'],
   ['client', 'framework-doctor-client.mjs'],
