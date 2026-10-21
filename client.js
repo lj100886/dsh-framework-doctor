@@ -30,7 +30,7 @@ window.__ModuleLoader__.load({
      * token 之间回退（不回退到硬编码色值），保证暗色模式不出现白底黑字。
      * ------------------------------------------------------------------ */
     var CSS = `
-.__fd_root{width:100%;max-width:960px;display:flex;flex-direction:column;gap:16px;font-size:13px;line-height:1.65;color:var(--dsw-alias-label-primary);--fd-border:var(--dsw-alias-border-l2,var(--dsw-alias-border-l1));--fd-accent:var(--dsw-alias-brand-primary,var(--dsw-alias-label-primary));--fd-ok:var(--dsw-alias-state-success-primary,var(--dsw-alias-label-secondary));--fd-warn:var(--dsw-alias-state-warn-primary,var(--dsw-alias-label-secondary));--fd-bad:var(--dsw-alias-state-error-primary,var(--dsw-alias-label-secondary));--fd-idle:var(--dsw-alias-state-idle-primary,var(--dsw-alias-label-tertiary))}
+.__fd_root{width:100%;max-width:var(--fd-max-width,1400px);margin:0 auto;display:flex;flex-direction:column;gap:16px;font-size:13px;line-height:1.65;color:var(--dsw-alias-label-primary);--fd-border:var(--dsw-alias-border-l2,var(--dsw-alias-border-l1));--fd-accent:var(--dsw-alias-brand-primary,var(--dsw-alias-label-primary));--fd-ok:var(--dsw-alias-state-success-primary,var(--dsw-alias-label-secondary));--fd-warn:var(--dsw-alias-state-warn-primary,var(--dsw-alias-label-secondary));--fd-bad:var(--dsw-alias-state-error-primary,var(--dsw-alias-label-secondary));--fd-idle:var(--dsw-alias-state-idle-primary,var(--dsw-alias-label-tertiary))}
 .__fd_root *{box-sizing:border-box;min-width:0}
 .__fd_root p{margin:0}
 .__fd_root h3{margin:0;font-size:15px;font-weight:600}
@@ -101,6 +101,9 @@ window.__ModuleLoader__.load({
 .__fd_root .__fd_toolRow{display:flex;align-items:center;gap:6px;padding:2px 10px;font-size:11px;color:var(--dsw-alias-label-tertiary)}
 .__fd_root .__fd_toolDot{width:5px;height:5px;border-radius:50%;background:var(--dsw-alias-brand-primary);opacity:.6}
 .__fd_root .__fd_toolName{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.__fd_root .__fd_widthCtl{display:inline-flex;align-items:center;gap:6px;font-size:12px}
+.__fd_root .__fd_widthCtl input[type=range]{width:110px;accent-color:var(--fd-accent);cursor:pointer}
+.__fd_root .__fd_widthVal{min-width:42px;text-align:right;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-secondary)}
 .__fd_root .__fd_report{border:1px solid var(--dsw-alias-border-l2);border-radius:8px;overflow:hidden;margin-bottom:10px}
 .__fd_root .__fd_chat{display:flex;flex-direction:column;gap:10px}
 .__fd_root .__fd_chatList{display:flex;flex-direction:column;gap:10px;max-height:460px;overflow-y:auto;padding:4px 2px}
@@ -274,6 +277,9 @@ window.__ModuleLoader__.load({
       cacheEgress: '出口 {ip}',
       sessionFailuresTitle: '最近出过事的会话',
       sessionFailuresHint: '直接读自会话日志：错误码分布 + 最后一次的原始报错',
+      widthLabel: '宽度',
+      widthHint: '拖动调整页面宽度，选择会被记住',
+      widthReset: '默认',
       allGood: '没有发现问题，框架是健康的。',
       diagFail: '体检失败',
       autoFixable: '可自动修复',
@@ -422,6 +428,9 @@ window.__ModuleLoader__.load({
       cacheEgress: 'egress {ip}',
       sessionFailuresTitle: 'Sessions that failed recently',
       sessionFailuresHint: 'Read straight from the session logs: error-code mix plus the last raw error',
+      widthLabel: 'Width',
+      widthHint: 'Drag to resize the page; your choice is remembered',
+      widthReset: 'Default',
       allGood: 'No findings — the framework is healthy.',
       diagFail: 'Check failed',
       autoFixable: 'auto-fixable',
@@ -1671,6 +1680,52 @@ window.__ModuleLoader__.load({
     /* ------------------------------------------------------------------ *
      * 页面：持有全部数据状态，三个区各自包 error boundary
      * ------------------------------------------------------------------ */
+    /* ------------------------------------------------------------------ *
+     * 页面宽度：可拖、可记
+     *
+     * 诊断结果、模型表、会话失败列表都是宽内容，固定 960px 挤得看不下去。
+     * 给一个滑块让用户自己决定——大屏能铺满，小屏能收窄。
+     *
+     * 存在 localStorage 而不是 Host 配置里：这是纯显示偏好，
+     * 跟着这台机器的这个浏览器走，不需要跨设备同步，也不该污染插件配置。
+     * ------------------------------------------------------------------ */
+    var WIDTH_MIN = 720;
+    var WIDTH_MAX = 2400;
+    var WIDTH_DEFAULT = 1400;
+    var WIDTH_STORAGE_KEY = 'dsh-framework-doctor:width';
+
+    /** 把任意输入夹到合法范围；非法值回落到默认。 */
+    function clampWidth(value) {
+      var num = typeof value === 'number' ? value : Number(value);
+      if (!Number.isFinite(num)) return WIDTH_DEFAULT;
+      if (num < WIDTH_MIN) return WIDTH_MIN;
+      if (num > WIDTH_MAX) return WIDTH_MAX;
+      return Math.round(num);
+    }
+
+    /** 读上次选的宽度；读不到或坏了就用默认值。 */
+    function readStoredWidth() {
+      try {
+        if (typeof window === 'undefined' || !window.localStorage) return WIDTH_DEFAULT;
+        var raw = window.localStorage.getItem(WIDTH_STORAGE_KEY);
+        if (raw === null) return WIDTH_DEFAULT;
+        return clampWidth(raw);
+      } catch (error) {
+        // 隐私模式下 localStorage 可能抛；不该因此让页面挂掉
+        return WIDTH_DEFAULT;
+      }
+    }
+
+    /** 记住宽度；失败无所谓，下次用默认值。 */
+    function storeWidth(value) {
+      try {
+        if (typeof window === 'undefined' || !window.localStorage) return;
+        window.localStorage.setItem(WIDTH_STORAGE_KEY, String(clampWidth(value)));
+      } catch (error) {
+        /* 忽略 */
+      }
+    }
+
     function Page(props) {
       var t = props.t || function (key) { return key; };
       var bump = react.useState(0)[1];
@@ -1684,6 +1739,17 @@ window.__ModuleLoader__.load({
       var chat = chatPair[0], setChat = chatPair[1];
       var billingPair = react.useState({ status: 'idle', snapshot: null, summary: null, error: '' });
       var billing = billingPair[0], setBilling = billingPair[1];
+
+      /* 页面宽度：可拖，记住选择。
+       *
+       * 为什么要有这个：诊断结果、模型表、会话失败列表都是宽内容，
+       * 960px 挤得看不下去。给一个滑块，用户自己决定多宽——
+       * 大屏能铺满，小屏能收窄。 */
+      var widthPair = react.useState(readStoredWidth());
+      var widthPx = widthPair[0], setWidthPx = widthPair[1];
+      react.useEffect(function () {
+        storeWidth(widthPx);
+      }, [widthPx]);
 
       /**
        * 读渠道插件的余额/积分。
@@ -1948,7 +2014,11 @@ window.__ModuleLoader__.load({
       var counts = countFindings(diag.findings, diag.summary);
       var score = healthScore(diag, data);
 
-      return h('div', { className: '__fd_root dsh-flat' },
+      return h('div', {
+        className: '__fd_root dsh-flat',
+        // 宽度可调：用 CSS 变量驱动，改一个变量就够，不用重排组件。
+        style: { '--fd-max-width': widthPx + 'px' },
+      },
         h('div', { className: '__fd_head' },
           h('div', null,
             h('h3', null, t('title')),
@@ -1957,7 +2027,25 @@ window.__ModuleLoader__.load({
             h('span', null, h('b', null, String(routes.length)), ' ', t('statProviders')),
             h('span', null, h('b', null, String(modelCount)), ' ', t('statModels')),
             h('span', null, t('statHealth'), ' ', h('b', { className: scoreClass(score) }, String(score))),
-            h('span', null, t('statLastScan'), ' ', h('b', null, diag.at ? timeText(diag.at) : '—')))),
+            h('span', null, t('statLastScan'), ' ', h('b', null, diag.at ? timeText(diag.at) : '—')),
+            // 宽度调节：拖动即时生效，松手写进 localStorage 下次记住。
+            h('span', { className: '__fd_widthCtl', title: t('widthHint') },
+              h('span', { className: '__fd_hint' }, t('widthLabel')),
+              h('input', {
+                type: 'range',
+                min: String(WIDTH_MIN),
+                max: String(WIDTH_MAX),
+                step: '20',
+                value: String(widthPx),
+                'aria-label': t('widthLabel'),
+                onChange: function (event) { setWidthPx(clampWidth(event.target.value)); },
+              }),
+              h('span', { className: '__fd_widthVal' }, String(widthPx)),
+              h('button', {
+                type: 'button',
+                onClick: function () { setWidthPx(WIDTH_DEFAULT); },
+                title: t('widthReset'),
+              }, t('widthReset'))))),
 
         snapshot.status === 'error'
           ? h('div', { className: '__fd_section' },

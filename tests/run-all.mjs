@@ -24,6 +24,7 @@ const SUITES = [
   ['agent', 'framework-doctor-agent.mjs'],
   ['host', 'framework-doctor-host.mjs'],
   ['client', 'framework-doctor-client.mjs'],
+  ['width', 'framework-doctor-width.mjs'],
 ];
 
 function run(file) {
