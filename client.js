@@ -82,12 +82,25 @@ window.__ModuleLoader__.load({
 .__fd_root .__fd_chainItemFirst{border-color:var(--dsw-alias-brand-primary)}
 .__fd_root .__fd_chainItemBad{opacity:.55;border-style:dashed}
 .__fd_root .__fd_chainIdx{font-weight:600;color:var(--dsw-alias-label-tertiary)}
+.__fd_root .__fd_chainEdit{display:flex;flex-direction:column;gap:6px}
+.__fd_root .__fd_chainRow{display:flex;align-items:center;gap:8px}
+.__fd_root .__fd_chainRowBad .__fd_select{opacity:.55;border-style:dashed}
+.__fd_root .__fd_chainRow .__fd_chainIdx{min-width:14px;text-align:right}
+.__fd_root select.__fd_select{flex:1;min-width:0;font-size:12px;padding:4px 8px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-3);color:inherit}
+.__fd_root .__fd_chainRemove{width:22px;height:22px;line-height:1;padding:0;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer}
+.__fd_root .__fd_chainRemove:hover{color:var(--fd-bad);border-color:var(--fd-bad)}
+.__fd_root .__fd_check{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--dsw-alias-label-secondary);cursor:pointer}
+.__fd_root .__fd_saved{font-size:12px;color:var(--fd-ok);margin:0}
 .__fd_root .__fd_billing{border-top:1px dashed var(--dsw-alias-border-l1);padding-top:8px;display:flex;flex-direction:column;gap:6px}
 .__fd_root .__fd_billingText{font-size:12px;color:var(--dsw-alias-state-warn-primary);margin:0}
 .__fd_root .__fd_billingRow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px}
 .__fd_root .__fd_billingLabel{font-weight:600}
 .__fd_root .__fd_cache{border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-2);padding:10px 12px;margin-bottom:10px;display:flex;flex-direction:column;gap:8px}
 .__fd_root .__fd_cacheRow{display:flex;gap:8px;align-items:flex-start;font-size:12px}
+.__fd_root .__fd_chatActions{display:flex;gap:6px;align-items:center}
+.__fd_root .__fd_toolRow{display:flex;align-items:center;gap:6px;padding:2px 10px;font-size:11px;color:var(--dsw-alias-label-tertiary)}
+.__fd_root .__fd_toolDot{width:5px;height:5px;border-radius:50%;background:var(--dsw-alias-brand-primary);opacity:.6}
+.__fd_root .__fd_toolName{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 .__fd_root .__fd_report{border:1px solid var(--dsw-alias-border-l2);border-radius:8px;overflow:hidden;margin-bottom:10px}
 .__fd_root .__fd_chat{display:flex;flex-direction:column;gap:10px}
 .__fd_root .__fd_chatList{display:flex;flex-direction:column;gap:10px;max-height:460px;overflow-y:auto;padding:4px 2px}
@@ -169,6 +182,8 @@ window.__ModuleLoader__.load({
       chatActionRunning: '执行中…',
       chatActionFailed: '执行失败',
       chatClear: '清空对话',
+      chatStop: '中断',
+      chatTimedOut: '这一轮还没跑完（已等 3 分钟）。它可能还在调工具；可以继续等，或按「中断」。',
       chatFail: '对话失败',
       sectionRepair: '③ 一键修复',
       sectionRepairHint: '能自动修的交给它，修不了的给出人话指引',
@@ -236,6 +251,11 @@ window.__ModuleLoader__.load({
       assistantModelEmpty: '还没有可用模型，请先选一个默认模型',
       chainCooling: '这个渠道刚失败过，暂时跳过',
       chainFallback: '兜底的默认模型',
+      chainAdd: '＋ 加一跳',
+      chainRemove: '删掉这一跳',
+      chainSave: '保存',
+      chainSaving: '保存中…',
+      chainFallbackLabel: '链都失败时退回默认模型',
       billingHint: '检测到 {n} 个渠道出现额度/限流问题——这类问题重试没用，需要你去充值或换套餐。',
       openBilling: '去处理额度',
       billingWhere: '余额、积分、账号都在「设置 → Our Free Model」这类渠道插件页里；框架医生读不到别家的账单，只能把你送过去。',
@@ -308,6 +328,8 @@ window.__ModuleLoader__.load({
       chatActionRunning: 'Running…',
       chatActionFailed: 'Failed',
       chatClear: 'Clear',
+      chatStop: 'Stop',
+      chatTimedOut: 'This turn is still running (waited 3 minutes). It may still be calling tools; keep waiting, or press Stop.',
       chatFail: 'Chat failed',
       sectionRepair: '③ Repair',
       sectionRepairHint: 'Auto-fix what can be fixed; the rest gets plain-language guidance',
@@ -375,6 +397,11 @@ window.__ModuleLoader__.load({
       assistantModelEmpty: 'No usable model yet — pick a default model first',
       chainCooling: 'This channel just failed and is being skipped',
       chainFallback: 'Default model, used as the last resort',
+      chainAdd: '+ Add hop',
+      chainRemove: 'Remove this hop',
+      chainSave: 'Save',
+      chainSaving: 'Saving…',
+      chainFallbackLabel: 'Fall back to the default model when every hop fails',
       billingHint: '{n} channel(s) hit quota or rate limits — retrying will not help; this needs a top-up or a plan change.',
       openBilling: 'Handle quota',
       billingWhere: 'Balance, credits and accounts live in channel plugins such as Settings → Our Free Model; the doctor cannot read their billing, so it only takes you there.',
@@ -1113,6 +1140,7 @@ window.__ModuleLoader__.load({
         billing: props.billing,
         onOpenBilling: props.onOpenBilling,
         onRefreshBilling: props.onRefreshBilling,
+        onSaved: props.onSavedModel,
       }),
 
       /* 渠道插件磁盘缓存里的真实失效原因（区域封锁 / 滥用流量）。 */
@@ -1202,38 +1230,172 @@ window.__ModuleLoader__.load({
      *   2. 渠道出问题时给出可操作提示——额度类问题直接给跳转，
      *      因为我们读不到别家插件的余额，只能把用户送到他自己的账单页。
      * ------------------------------------------------------------------ */
+    /**
+     * 框架医生自己的模型：可增删的候选链 +「跟随默认模型」开关。
+     *
+     * 为什么做成可选而不是只读：这条链原来只能改 cordis.patch.yml 才动得了，
+     * 而用户对一个设置页的期待就是"在这儿能改"。机制直接复用主对话那套——
+     * 读宿主 `agentDefaultModel` 拿当前默认模型（`data.defaultSelection`），
+     * 写的时候走 configEditor 通道落到 profile patch，由 Loader reconcile 生效。
+     *
+     * 选项来自 `data.llmProviders`（宿主 `llm.listProviders()` 的真实注册表），
+     * 所以 Our Free Model 这类渠道注册进来的 provider 会直接出现在下拉里。
+     */
     function AssistantModelPanel(props) {
       var t = props.t;
       var data = props.data || {};
       var info = data.assistantModel || { chain: [], explicit: false, fallbackToDefaultModel: true };
+      var providers = Array.isArray(data.llmProviders) ? data.llmProviders : [];
       var rows = Array.isArray(data.channelHealth) ? data.channelHealth : [];
-      var chain = Array.isArray(info.chain) ? info.chain : [];
+
+      // 已配置的链（不含"跟随默认"那一跳，它是开关不是条目）。
+      var configured = (Array.isArray(info.chain) ? info.chain : [])
+        .filter(function (entry) { return entry && entry.source !== 'default'; });
+      // 编辑中的链：本地副本，保存时才落盘。
+      var draft = react.useState(function () {
+        return configured.map(function (e) { return { provider: e.provider, model: e.model }; });
+      });
+      var chainDraft = draft[0];
+      var setChainDraft = draft[1];
+      var fallbackState = react.useState(info.fallbackToDefaultModel !== false);
+      var fallbackDraft = fallbackState[0];
+      var setFallbackDraft = fallbackState[1];
+      var busyState = react.useState(false);
+      var busy = busyState[0];
+      var setBusy = busyState[1];
+      var errorState = react.useState('');
+      var error = errorState[0];
+      var setError = errorState[1];
+      var savedState = react.useState('');
+      var saved = savedState[0];
+      var setSaved = savedState[1];
+
+      // 脏检查：和落盘值一致就不让按保存，避免无效写入触发 Loader reconcile。
+      var dirty = JSON.stringify(chainDraft) !== JSON.stringify(configured) ||
+        fallbackDraft !== (info.fallbackToDefaultModel !== false);
 
       // 只看这一轮（框架医生自己）的失败记录，别的会话的不混进来。
       var mine = rows.filter(function (row) { return String(row.sessionId || '').indexOf('framework-doctor:') === 0; });
       var coolingNow = mine.filter(function (row) { return row.cooling; });
       var billing = mine.filter(function (row) { return row.billing; });
 
-      if (chain.length === 0 && mine.length === 0) return null;
+      // 把 provider/model 摊平成 "provider/model" 选项，主对话的选择器也是这个形状。
+      var options = [];
+      providers.forEach(function (provider) {
+        var models = Array.isArray(provider.models) ? provider.models : [];
+        models.forEach(function (model) {
+          options.push({
+            value: provider.id + '/' + model.id,
+            label: (model.name || model.id) + '  ·  ' + provider.id + '/' + model.id,
+            provider: provider.id,
+            model: model.id,
+          });
+        });
+      });
+      var optionByValue = {};
+      options.forEach(function (o) { optionByValue[o.value] = o; });
+
+      function save() {
+        setBusy(true); setError(''); setSaved('');
+        api('/assistant-model', {
+          method: 'POST',
+          body: { chain: chainDraft, fallbackToDefaultModel: fallbackDraft },
+          timeout: 15000,
+        }).then(function (result) {
+          setSaved('已保存，' + ((result && result.chain) || []).length + ' 跳');
+          if (props.onSaved) props.onSaved(result);
+        }).catch(function (err) {
+          setError(err && err.message ? err.message : String(err));
+        }).then(function () { setBusy(false); });
+      }
+
+      function addHop() {
+        // 默认挑第一个还没进链的选项；全加了就静默不动。
+        for (var i = 0; i < options.length; i++) {
+          var o = options[i];
+          var exists = chainDraft.some(function (e) { return e.provider === o.provider && e.model === o.model; });
+          if (!exists) {
+            setChainDraft(chainDraft.concat([{ provider: o.provider, model: o.model }]));
+            return;
+          }
+        }
+      }
+
+      function removeHop(index) {
+        setChainDraft(chainDraft.filter(function (_, i) { return i !== index; }));
+      }
+
+      function changeHop(index, value) {
+        var picked = optionByValue[value];
+        if (!picked) return;
+        var next = chainDraft.slice();
+        next[index] = { provider: picked.provider, model: picked.model };
+        setChainDraft(next);
+      }
 
       return h('div', { className: '__fd_assist' },
         h('div', { className: '__fd_assistHead' },
           h('span', { className: '__fd_assistTitle' }, t('assistantModel')),
           h('span', { className: '__fd_hint' },
-            info.explicit ? t('assistantModelConfig') : t('assistantModelDefault'))),
-        chain.length
-          ? h('div', { className: '__fd_chain' },
-              chain.map(function (entry, index) {
+            chainDraft.length > 0 ? t('assistantModelConfig') : t('assistantModelDefault'))),
+
+        /* 候选链编辑区 */
+        chainDraft.length === 0
+          ? h('p', { className: '__fd_hint' }, t('assistantModelEmpty'))
+          : h('div', { className: '__fd_chainEdit' },
+              chainDraft.map(function (entry, index) {
                 var isCooling = coolingNow.some(function (row) { return row.route === entry.provider; });
-                return h('span', {
-                  key: entry.provider + '/' + entry.model,
-                  className: '__fd_chainItem' + (isCooling ? ' __fd_chainItemBad' : index === 0 ? ' __fd_chainItemFirst' : ''),
-                  title: isCooling ? t('chainCooling') : (entry.source === 'default' ? t('chainFallback') : ''),
+                return h('div', {
+                  key: entry.provider + '/' + entry.model + '#' + index,
+                  className: '__fd_chainRow' + (isCooling ? ' __fd_chainRowBad' : ''),
                 },
-                h('span', { className: '__fd_chainIdx' }, String(index + 1)),
-                h('span', { className: '__fd_mid' }, entry.provider + ' / ' + entry.model));
-              }))
-          : h('p', { className: '__fd_hint' }, t('assistantModelEmpty')),
+                  h('span', { className: '__fd_chainIdx' }, String(index + 1)),
+                  h('select', {
+                    className: '__fd_select',
+                    value: entry.provider + '/' + entry.model,
+                    title: isCooling ? t('chainCooling') : '',
+                    onChange: function (event) { changeHop(index, event.target.value); },
+                  }, options
+                    .filter(function (o) {
+                      return o.provider === entry.provider && o.model === entry.model;
+                    })
+                    .concat(options.filter(function (o) {
+                      return !(o.provider === entry.provider && o.model === entry.model);
+                    }))
+                    .map(function (o) {
+                      return h('option', { key: o.value, value: o.value }, o.label);
+                    })),
+                  h('button', {
+                    type: 'button',
+                    className: '__fd_chainRemove',
+                    title: t('chainRemove'),
+                    onClick: function () { removeHop(index); },
+                  }, '×'));
+              })),
+
+        /* 操作行 */
+        h('div', { className: '__fd_actions' },
+          h('button', {
+            type: 'button',
+            disabled: busy || options.length === 0,
+            onClick: addHop,
+          }, t('chainAdd')),
+          h('label', { className: '__fd_check' },
+            h('input', {
+              type: 'checkbox',
+              checked: fallbackDraft,
+              onChange: function (event) { setFallbackDraft(event.target.checked); },
+            }),
+            t('chainFallbackLabel')),
+          h('button', {
+            type: 'button',
+            className: '__fd_primary',
+            disabled: busy || !dirty,
+            onClick: save,
+          }, busy ? t('chainSaving') : t('chainSave'))),
+
+        error === '' ? null : h('p', { className: '__fd_error' }, error),
+        saved === '' ? null : h('p', { className: '__fd_saved' }, saved),
 
         billing.length
           ? h('div', { className: '__fd_billing' },
@@ -1333,15 +1495,25 @@ window.__ModuleLoader__.load({
       return h(Section, {
         title: t('sectionChat'),
         hint: t('sectionChatHint'),
-        right: messages.length
-          ? h('button', { type: 'button', disabled: sending, onClick: props.onClear }, t('chatClear'))
-          : null,
+        right: h('span', { className: '__fd_chatActions' },
+          sending
+            ? h('button', { type: 'button', onClick: props.onStop }, t('chatStop'))
+            : null,
+          messages.length
+            ? h('button', { type: 'button', disabled: sending, onClick: props.onClear }, t('chatClear'))
+            : null),
       },
       h('div', { className: '__fd_chat' },
         h('div', { className: '__fd_chatList', ref: listRef },
           messages.length === 0
             ? h('p', { className: '__fd_hint' }, t('chatEmpty'))
             : messages.map(function (message, index) {
+                // 工具调用行：显示 agent 正在/曾经调了什么工具
+                if (message.role === 'tool') {
+                  return h('div', { key: 'msg-' + index, className: '__fd_toolRow' },
+                    h('span', { className: '__fd_toolDot' }),
+                    h('span', { className: '__fd_toolName' }, String(message.tool || 'tool')));
+                }
                 var mine = message.role === 'user';
                 return h('div', {
                   key: 'msg-' + index,
@@ -1386,7 +1558,10 @@ window.__ModuleLoader__.load({
                   h('div', { className: '__fd_bubbleWho' }, t('chatBot')),
                   h('div', { className: '__fd_bubbleText __fd_hint' }, t('chatSending'))))
             : null),
-        chat.error ? h('p', { className: '__fd_error' }, t('chatFail') + '：' + chat.error) : null,
+        chat.timedOut
+        ? h('p', { className: '__fd_hint' }, t('chatTimedOut'))
+        : null,
+      chat.error ? h('p', { className: '__fd_error' }, t('chatFail') + '：' + chat.error) : null,
         h('div', { className: '__fd_chatInput' },
           h('textarea', {
             value: input,
@@ -1585,31 +1760,28 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /**
+       * 发一条消息给框架医生。
+       *
+       * 后端现在跑的是**真 agent**：它自己带工具、流式、压缩、故障转移。
+       * 所以这里不再自己拼历史——会话在 Host 侧持久，返回的 transcript 就是
+       * 完整记录。我们只负责把这条记录画出来。
+       */
       function runChat(text) {
-        var userMessage = { role: 'user', text: text };
         setChat(function (previous) {
-          return Object.assign({}, previous, {
-            messages: (previous.messages || []).concat([userMessage]),
-            status: 'running',
-            error: '',
-          });
+          return Object.assign({}, previous, { status: 'running', error: '' });
         });
-        // 带上历史（不含刚加的这条，后端会单独接 message）。
-        var history = (chat.messages || []).slice(-8).map(function (entry) {
-          return { role: entry.role, text: entry.text };
-        });
-        return api('/chat', { method: 'POST', body: { message: text, messages: history }, timeout: 180000 })
+        return api('/chat', { method: 'POST', body: { message: text }, timeout: 200000 })
           .then(function (data) {
             setChat(function (previous) {
               return Object.assign({}, previous, {
                 status: 'idle',
                 error: '',
-                messages: (previous.messages || []).concat([{
-                  role: 'assistant',
-                  text: typeof data.reply === 'string' ? data.reply : '',
-                  consulted: Array.isArray(data.consulted) ? data.consulted : [],
-                  actions: Array.isArray(data.actions) ? data.actions : [],
-                }]),
+                sessionId: data.sessionId || previous.sessionId,
+                agent: data.agent || null,
+                timedOut: data.timedOut === true,
+                // 直接采用 Host 侧的记录：刷新也不会丢，且是 agent 真正写下的。
+                messages: Array.isArray(data.transcript) ? data.transcript : previous.messages,
               });
             });
           })
@@ -1618,6 +1790,35 @@ window.__ModuleLoader__.load({
               return Object.assign({}, previous, { status: 'idle', error: humanError(t, error) });
             });
           });
+      }
+
+      /** 只读拉取当前会话状态（页面打开时用，不创建、不投消息）。 */
+      function loadChatState() {
+        return api('/chat/state', { timeout: 20000 })
+          .then(function (data) {
+            if (!data || !data.agent || !data.agent.exists) return null;
+            setChat(function (previous) {
+              return Object.assign({}, previous, {
+                sessionId: data.sessionId || '',
+                agent: data.agent,
+                messages: Array.isArray(data.transcript) ? data.transcript : previous.messages,
+              });
+            });
+            return null;
+          })
+          .catch(function () { return null; });
+      }
+
+      /** 中断正在跑的这一轮。 */
+      function stopChat() {
+        return api('/chat/stop', { method: 'POST', body: {}, timeout: 20000 })
+          .then(function () {
+            setChat(function (previous) {
+              return Object.assign({}, previous, { status: 'idle' });
+            });
+            return null;
+          })
+          .catch(function () { return null; });
       }
 
       /** 执行 AI 建议的动作：写操作只有用户按下这个按钮才会发生。 */
@@ -1746,14 +1947,20 @@ window.__ModuleLoader__.load({
             onRepairOne: function (id) { runRepair([id]); },
             onOpenBilling: openBilling,
             onRefreshBilling: loadBilling,
+            onSavedModel: refreshState,
           })),
 
         h(Boundary, { t: t, title: t('sectionChat') },
           h(ChatSection, {
             t: t, chat: chat,
             onSend: runChat,
+            onStop: stopChat,
             onAction: function (action, key) { runChatAction(action, key); },
-            onClear: function () { setChat({ messages: [], status: 'idle', error: '', actionResults: {} }); },
+            onClear: function () {
+              // 清空显示并重置 Host 侧会话，下次提问是全新的一轮。
+              setChat({ messages: [], status: 'idle', error: '', actionResults: {} });
+              api('/chat', { method: 'POST', body: { reset: true }, timeout: 30000 }).catch(function () {});
+            },
           })),
 
         h(Boundary, { t: t, title: t('sectionRepair') },

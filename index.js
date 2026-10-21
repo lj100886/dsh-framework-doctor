@@ -219,6 +219,48 @@ async function readCredentialState(ctx, providers) {
  * 运行时状态
  * ------------------------------------------------------------------ */
 
+/**
+ * 已注册的 provider 及其模型清单。
+ *
+ * 模型选择器要按 provider/model 两级展开，光有 provider id 不够用；
+ * `llm.listModels(provider)` 是异步的，所以这里也是异步的。
+ *
+ * 单个 provider 列模型失败不该让整份清单空掉——那会让选择器一个选项都没有，
+ * 所以失败的那个只留下 id、models 给空数组，其余照常返回。
+ */
+async function readLlmProvidersWithModels(ctx) {
+  const llm = ctx.get('llm');
+  if (!llm || typeof llm.listProviders !== 'function') return null;
+  let list;
+  try {
+    list = llm.listProviders();
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(list)) return null;
+
+  const out = [];
+  for (const row of list) {
+    const id = String(row?.id ?? '');
+    if (!id) continue;
+    const entry = { id, name: String(row?.name ?? id), models: [] };
+    if (typeof llm.listModels === 'function') {
+      try {
+        const models = await llm.listModels(id);
+        if (Array.isArray(models)) {
+          entry.models = models
+            .map((m) => ({ id: String(m?.id ?? ''), name: String(m?.name ?? m?.id ?? '') }))
+            .filter((m) => m.id !== '');
+        }
+      } catch {
+        // 保留 id，models 留空
+      }
+    }
+    out.push(entry);
+  }
+  return out;
+}
+
 function readLlmProviders(ctx) {
   const llm = ctx.get('llm');
   if (!llm || typeof llm.listProviders !== 'function') return null;
@@ -366,6 +408,8 @@ function apply(ctx, config) {
   const loadRepair = () => load('repair', () => import('./lib/repair.js'));
   const loadFailover = () => load('failover', () => import('./lib/failover.js'));
   const loadAssistantModel = () => load('assistant-model', () => import('./lib/assistant-model.js'));
+  const loadDoctorAgent = () => load('doctor-agent', () => import('./lib/doctor-agent.js'));
+  const loadComboAudit = () => load('combo-audit', () => import('./lib/combo-audit.js'));
   const loadLocalChannelState = () => load('local-channel-state', () => import('./lib/local-channel-state.js'));
 
   /**
@@ -493,16 +537,17 @@ function apply(ctx, config) {
     const target = readTarget(settings);
     if (target.error) return { error: target.error };
     const providers = target.providers;
-    const [credentialState, plugins] = await Promise.all([
+    const [credentialState, plugins, llmProviders] = await Promise.all([
       readCredentialState(ctx, providers),
       readPlugins(ctx),
+      readLlmProvidersWithModels(ctx),
     ]);
     return {
       providers,
       revision: target.revision,
       credentialState,
       plugins,
-      llmProviders: readLlmProviders(ctx),
+      llmProviders,
       defaultSelection: readDefaultSelection(ctx),
     };
   }
@@ -593,6 +638,7 @@ function apply(ctx, config) {
     ['probe', '{"baseURL":"https://...","api":"可选","apiKey":"可选"}', '实时访问一个端点，返回它公布的模型清单与推导出的能力'],
     ['channel-health', '{}', '各渠道最近的失败档案：错误类型、连续失败次数、严重度、是否额度问题、冷却到什么时候。写"哪个渠道坏了 / 要不要充值 / 什么时候恢复"这类报告时用它'],
     ['channel-cache', '{}', '读渠道插件落在本地磁盘上的状态缓存：每个模型为什么不可用（区域封锁 / 被判定滥用流量 / 其它），附端点原话和出口 IP。比看错误码精确'],
+    ['combo-audit', '{}', '检查 Our Free Model 的 combo 降级链：每一跳打的是哪个上游、当前可用性、有几跳是重复的同一上游、有没有真备胎。用户抱怨"用了 combo 还是不行"时先看这个'],
   ];
 
   /** 执行一次信息工具，返回给模型看的纯文本。任何失败都变成可读文本，不抛。 */
@@ -729,6 +775,15 @@ function apply(ctx, config) {
         return loaded.mod.describeLocalStates(states);
       }
 
+      if (tool === 'combo-audit') {
+        const loaded = await loadComboAudit();
+        if (!loaded.ok) return `combo 审计模块加载失败：${loaded.error}`;
+        const home = resolveDshHome();
+        if (!home) return '解析不出 DSH home，无法定位 combo 配置。';
+        const result = loaded.mod.analyzeAllCombos(home);
+        return loaded.mod.describeCombos(result);
+      }
+
       return `未知的信息工具 "${tool}"。可用的：${INFO_TOOLS.map((t) => t[0]).join('、')}`;
     } catch (error) {
       return `工具 ${tool} 执行出错：${messageOf(error)}`;
@@ -767,6 +822,128 @@ function apply(ctx, config) {
    *   - 按需取数：模型可以在回复里写 `TOOL: {"name":"plugins","args":{}}`，
    *     Host 执行只读工具并把结果回喂，最多 4 轮，然后给最终回答；
    *   - 动作建议：回复末尾的 `ACTIONS:` 段变成可点击按钮，写操作由用户按下才执行。
+   */
+  /**
+   * 框架医生的真 agent 通道。
+   *
+   * 和下面那个手搓的 chat() 不同：这里创建/复用一个**真会话**，交给 harness
+   * 自己的 agent loop 驱动。工具、流式、压缩、审批、故障转移全部继承，
+   * 我们只做三件事：建会话、投消息、把 transcript 读回来。
+   *
+   * 为什么值得这么绕：手搓的 chat 只能靠"TOOL: {...}"文本协议让模型要数据，
+   * 而真 agent 能直接调用 ctx.tools 里的任何工具，还能在失败时走
+   * agent/request-error 的故障转移——这正是用户要的"对话栏那套逻辑"。
+   *
+   * @param {{message?: string, cwd?: string, reset?: boolean}} body
+   */
+  async function runDoctorAgent(body) {
+    const agents = ctx.get('agents');
+    if (!agents || typeof agents.create !== 'function') {
+      return { ok: false, error: 'agent 服务不可用（ctx.agents 未提供），无法开真会话' };
+    }
+    const loaded = await loadDoctorAgent();
+    if (!loaded.ok) return { ok: false, error: `会话模块加载失败：${loaded.error}` };
+    const mod = loaded.mod;
+
+    const cwd = typeof body.cwd === 'string' && body.cwd.length > 0 ? body.cwd : process.cwd();
+    const sessionId = mod.doctorSessionId(cwd);
+    const text = typeof body.message === 'string' ? body.message.trim() : '';
+
+    // 已有会话就直接用（保留上下文）；reset 时先扔掉。
+    let agent = typeof agents.get === 'function' ? agents.get(sessionId) : undefined;
+    if (agent && body.reset === true) {
+      try {
+        agent.cancel?.({ kind: 'disposed' });
+      } catch {
+        /* 已经停了 */
+      }
+      agent = undefined;
+    }
+
+    if (!agent) {
+      try {
+        agent = await agents.create({
+          sessionId,
+          meta: { cwd },
+          seed: [{ role: 'user', content: [{ type: 'text', text: mod.DOCTOR_BRIEF }] }],
+          agentOptions: {
+            // 用用户配置的模型链（assistant-model 那套），没配就跟随默认模型
+            ...(cfg.model?.chain ? { model: cfg.model } : {}),
+          },
+        });
+      } catch (error) {
+        return { ok: false, error: `创建诊断会话失败：${messageOf(error)}` };
+      }
+    }
+
+    if (text.length === 0) {
+      // 只查状态，不投消息
+      return {
+        ok: true,
+        sessionId,
+        agent: mod.describeAgent(agent),
+        transcript: mod.projectTranscript(readSessionEvents(agent)),
+      };
+    }
+
+    // 投递：send 是"排进 inbox 并唤醒驱动"，不会阻塞到模型答完。
+    try {
+      await agent.send([{ type: 'text', text }]);
+    } catch (error) {
+      return { ok: false, error: `投递消息失败：${messageOf(error)}` };
+    }
+
+    // 等它跑完这一轮（有超时，避免页面永远转圈）。
+    const waitMs = Number.isFinite(body.waitMs) ? body.waitMs : 180_000;
+    let timedOut = false;
+    let timer = null;
+    try {
+      await Promise.race([
+        typeof agent.whenIdle === 'function' ? agent.whenIdle() : Promise.resolve(),
+        new Promise((resolve) => {
+          timer = setTimeout(() => { timedOut = true; resolve(); }, waitMs);
+          // 别让这个 timer 拖住进程退出（Node 的 timer 默认会 keep-alive）
+          timer.unref?.();
+        }),
+      ]);
+    } catch (error) {
+      return { ok: false, error: `等待模型回复失败：${messageOf(error)}` };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+
+    return {
+      ok: true,
+      sessionId,
+      agent: mod.describeAgent(agent),
+      timedOut,
+      transcript: mod.projectTranscript(readSessionEvents(agent)),
+    };
+  }
+
+  /**
+   * 读一个 agent 的会话事件。
+   *
+   * 用 session.snapshotEvents()（运行时确认存在）而不是自己维护数组：
+   * 页面看到的就是 agent 真正记下来的东西，刷新也不会丢。
+   */
+  function readSessionEvents(agent) {
+    try {
+      const session = agent?.session;
+      if (!session) return [];
+      if (typeof session.snapshotEvents === 'function') return session.snapshotEvents();
+      if (typeof session.ownEvents === 'function') return session.ownEvents();
+      return [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * 手搓的简易对话（保留作为兜底）。
+   *
+   * 真 agent 起不来时（agent 服务缺失、创建失败）还能用这条路径回答问题。
+   * 它只有只读信息工具，不能调真工具——能力弱，但不会整个页面不能用。
    */
   async function chat(body) {
     const llm = ctx.get('llm');
@@ -1467,16 +1644,17 @@ function apply(ctx, config) {
         sendJson(res, 500, { ok: false, error: target.error });
         return;
       }
-      const [credentialState, plugins] = await Promise.all([
+      const [credentialState, plugins, llmProviders] = await Promise.all([
         readCredentialState(ctx, target.providers),
         readPlugins(ctx),
+        readLlmProvidersWithModels(ctx),
       ]);
       sendJson(res, 200, {
         ok: true,
         providers: summarizeProviders(target.providers),
         defaultSelection: readDefaultSelection(ctx),
         credentialState,
-        llmProviders: readLlmProviders(ctx),
+        llmProviders,
         plugins,
         lastScanAt: lastScan?.scannedAt ?? null,
         health: lastScan?.health ?? null,
@@ -1514,6 +1692,69 @@ function apply(ctx, config) {
           failoverMaxCooldownMs: cfg.failoverMaxCooldownMs,
           probeTimeoutMs: cfg.probeTimeoutMs,
         },
+      });
+      return;
+    }
+
+    if (route === '/assistant-model' && req.method === 'POST') {
+      const body = await readBody(req);
+      const chain = Array.isArray(body.chain) ? body.chain : [];
+      const fallbackToDefaultModel = body.fallbackToDefaultModel !== false;
+
+      // 归一化 + 去重：同一条路径配两遍没有意义，保留首次出现的位置。
+      const entries = [];
+      const seen = new Set();
+      for (const row of chain) {
+        if (!isObject(row)) continue;
+        const provider = typeof row.provider === 'string' ? row.provider.trim() : '';
+        const model = typeof row.model === 'string' ? row.model.trim() : '';
+        if (!provider || !model) continue;
+        const key = provider + '\0' + model;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        entries.push({ provider, model });
+        if (entries.length >= 8) break; // 链太长没有意义，截断
+      }
+
+      // 写进 profile patch 的 configEditor 通道：内核会按 entry 的 schema 校验、
+      // 加文件锁落盘、再 reconcile Loader，改动即刻生效且不留半截状态。
+      const editor = ctx.get('configEditor');
+      if (!editor || typeof editor.edit !== 'function') {
+        sendJson(res, 501, { ok: false, error: '当前组合没有挂载 configEditor，无法写入配置（headless / SDK 组合不支持）' });
+        return;
+      }
+      const entry = editor.entries().find((e) => e?.options?.id === 'framework-doctor');
+      if (!entry) {
+        sendJson(res, 500, { ok: false, error: '在 Loader 中找不到 framework-doctor 条目，无法写入配置' });
+        return;
+      }
+      try {
+        await editor.edit(entry, (current) => ({
+          ...current,
+          model: {
+            chain: entries,
+            fallbackToDefaultModel,
+          },
+        }));
+      } catch (error) {
+        sendJson(res, 500, { ok: false, error: messageOf(error) });
+        return;
+      }
+
+      sendJson(res, 200, {
+        ok: true,
+        chain: entries,
+        fallbackToDefaultModel,
+        // 让页面立刻刷新显示，不必等下一次轮询。
+        assistantModel: (() => {
+          const selection = readDefaultSelection(ctx);
+          const rows = entries.map((e) => ({ ...e, source: 'chain' }));
+          if (fallbackToDefaultModel && selection?.provider && selection?.model &&
+              !rows.some((e) => e.provider === selection.provider && e.model === selection.model)) {
+            rows.push({ provider: selection.provider, model: selection.model, source: 'default' });
+          }
+          return { chain: rows, explicit: entries.length > 0, fallbackToDefaultModel };
+        })(),
       });
       return;
     }
@@ -1579,8 +1820,79 @@ function apply(ctx, config) {
 
     if (route === '/chat' && req.method === 'POST') {
       const body = await readBody(req);
+      // 优先走真 agent（完整能力）。它不可用/起不来就退回只读的简易对话，
+      // 保证这个页面在任何情况下都还能回答问题。
+      let viaAgent = { ok: false, error: '' };
+      try {
+        viaAgent = await runDoctorAgent(body);
+      } catch (error) {
+        viaAgent = { ok: false, error: messageOf(error) };
+      }
+      if (viaAgent.ok) {
+        sendJson(res, 200, viaAgent);
+        return;
+      }
+      // 明确的"用户要求简易模式"或者 agent 通道不可用 → 走兜底
       const result = await chat(body);
-      sendJson(res, result.ok ? 200 : 500, result);
+      if (result.ok) {
+        sendJson(res, 200, {
+          ...result,
+          // 告诉页面这次是兜底模式，方便它显示提示
+          degraded: true,
+          degradedReason: viaAgent.error,
+        });
+        return;
+      }
+      // 两条路都失败：把 agent 的失败原因一起报出来，比只说兜底失败有用
+      sendJson(res, 500, {
+        ok: false,
+        error: `${result.error}${viaAgent.error ? `（真会话通道：${viaAgent.error}）` : ''}`,
+      });
+      return;
+    }
+
+    // 只读：看诊断会话现在的状态和记录（不投消息，不创建）。
+    if (route === '/chat/state' && req.method === 'GET') {
+      const loaded = await loadDoctorAgent();
+      if (!loaded.ok) {
+        sendJson(res, 500, { ok: false, error: loaded.error });
+        return;
+      }
+      const agents = ctx.get('agents');
+      const cwd = new URL(req.url ?? '/', 'http://localhost').searchParams.get('cwd') || process.cwd();
+      const sessionId = loaded.mod.doctorSessionId(cwd);
+      const agent = agents && typeof agents.get === 'function' ? agents.get(sessionId) : undefined;
+      sendJson(res, 200, {
+        ok: true,
+        sessionId,
+        agent: loaded.mod.describeAgent(agent),
+        transcript: agent ? loaded.mod.projectTranscript(readSessionEvents(agent)) : [],
+      });
+      return;
+    }
+
+    // 中断正在跑的诊断会话。
+    if (route === '/chat/stop' && req.method === 'POST') {
+      const body = await readBody(req);
+      const loaded = await loadDoctorAgent();
+      if (!loaded.ok) {
+        sendJson(res, 500, { ok: false, error: loaded.error });
+        return;
+      }
+      const agents = ctx.get('agents');
+      const cwd = typeof body.cwd === 'string' && body.cwd.length > 0 ? body.cwd : process.cwd();
+      const sessionId = loaded.mod.doctorSessionId(cwd);
+      const agent = agents && typeof agents.get === 'function' ? agents.get(sessionId) : undefined;
+      if (!agent) {
+        sendJson(res, 200, { ok: true, stopped: false, reason: '没有进行中的诊断会话' });
+        return;
+      }
+      try {
+        agent.cancel?.({ kind: 'aborted' });
+        sendJson(res, 200, { ok: true, stopped: true });
+      } catch (error) {
+        sendJson(res, 500, { ok: false, error: messageOf(error) });
+      }
       return;
     }
 
